@@ -275,6 +275,8 @@ pub async fn run() -> Result<()> {
     if clip::available() {
         tokio::spawn(watch_clipboard(st.clone()));
     }
+    #[cfg(target_os = "macos")]
+    tokio::spawn(watch_airdrop(st.clone()));
     st.start_localsend().await;
 
     let listener = tokio::net::UnixListener::bind(&sock)?;
@@ -360,6 +362,50 @@ async fn watch_clipboard(st: Arc<State>) {
         }
         let Some(text) = clip::get() else { continue };
         st.spread(Source::Local, text).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn from_airdrop(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::getxattr(p.as_ptr(), c"com.apple.quarantine".as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0)
+    };
+    n > 0 && buf[..n as usize].windows(10).any(|w| w == b";sharingd;")
+}
+
+#[cfg(target_os = "macos")]
+async fn watch_airdrop(st: Arc<State>) {
+    let dir = store::home().join("Downloads");
+    let started = SystemTime::now();
+    let mut checked = std::collections::HashSet::new();
+    let mut last = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let Ok(m) = tokio::fs::metadata(&dir).await.and_then(|m| m.modified()) else { continue };
+        if last == Some(m) {
+            continue;
+        }
+        last = Some(m);
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else { continue };
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name();
+            if name.to_string_lossy().starts_with('.') || checked.contains(&name) {
+                continue;
+            }
+            let Ok(meta) = e.metadata().await else { continue };
+            if meta.created().or_else(|_| meta.modified()).is_ok_and(|t| t < started) {
+                checked.insert(name);
+                continue;
+            }
+            let path = e.path();
+            if from_airdrop(&path) {
+                st.log("file_in", "AirDrop", path.display().to_string());
+            }
+            checked.insert(name);
+        }
     }
 }
 

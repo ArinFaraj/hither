@@ -10,6 +10,30 @@ struct Device: Identifiable, Hashable {
     let clip: Bool
     let phone: Bool
     let localsend: Bool
+
+    var airdrop: Bool { id == AirDrop.id }
+
+    static let airdropRow = Device(id: AirDrop.id, name: "AirDrop", via: ["airdrop"], clip: true, phone: false, localsend: false)
+}
+
+enum AirDrop {
+    static let id = "airdrop"
+
+    static var available: Bool { NSSharingService(named: .sendViaAirDrop) != nil }
+
+    @MainActor
+    static func share(_ items: [Any]) -> Bool {
+        guard let s = NSSharingService(named: .sendViaAirDrop), s.canPerform(withItems: items) else { return false }
+        NSApp.activate(ignoringOtherApps: true)
+        s.perform(withItems: items)
+        return true
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        _ = AirDrop.share(urls)
+    }
 }
 
 struct Event: Identifiable {
@@ -68,7 +92,7 @@ final class Model: ObservableObject {
         name = s["name"] as? String ?? ""
         clip = s["clip"] as? Bool ?? false
         inbox = s["inbox"] as? String ?? ""
-        devices = (d["devices"] as? [[String: Any]] ?? []).map {
+        var list = (d["devices"] as? [[String: Any]] ?? []).map {
             let serial = $0["serial"] as? String
             let ls = $0["localsend"] as? String
             return Device(
@@ -80,6 +104,8 @@ final class Model: ObservableObject {
                 localsend: ls != nil
             )
         }
+        if AirDrop.available { list.append(.airdropRow) }
+        devices = list
         recent = (r["recent"] as? [[String: Any]] ?? []).prefix(5).map {
             Event(
                 kind: $0["kind"] as? String ?? "",
@@ -101,6 +127,10 @@ final class Model: ObservableObject {
 
     func send(_ d: Device, _ urls: [URL]) async {
         guard !urls.isEmpty else { return }
+        if d.airdrop {
+            if !AirDrop.share(urls) { flash(d, "AirDrop can't send these") }
+            return
+        }
         status[d.id] = urls.count == 1 ? "Sending \(urls[0].lastPathComponent)" : "Sending \(urls.count) files"
         let r = await CLI.run(["send", d.id] + urls.map(\.path))
         flash(d, r["ok"] as? Bool == true ? "Sent" : r["error"] as? String ?? "Failed")
@@ -109,6 +139,10 @@ final class Model: ObservableObject {
 
     func sendClipboard(_ d: Device) async {
         guard let text = NSPasteboard.general.string(forType: .string) else { return flash(d, "Clipboard is empty") }
+        if d.airdrop {
+            if !AirDrop.share([text]) { flash(d, "AirDrop can't send this") }
+            return
+        }
         let r = await CLI.run(["clip", "send", d.id, "-"], input: text)
         flash(d, r["ok"] as? Bool == true ? "Clipboard sent" : r["error"] as? String ?? "Failed")
     }
@@ -287,13 +321,14 @@ struct DeviceRow: View {
             if v.hasPrefix("direct") { return "Internet" }
             if v.hasPrefix("relay") { return "Internet (relay)" }
             if v.hasPrefix("localsend") { return "LocalSend" }
+            if v == "airdrop" { return "Nearby Apple devices" }
             return v
         }.joined(separator: ", ")
     }
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: d.phone ? "iphone" : "laptopcomputer")
+            Image(systemName: d.airdrop ? "dot.radiowaves.left.and.right" : d.phone ? "iphone" : "laptopcomputer")
                 .frame(width: 18)
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 1) {
@@ -304,7 +339,7 @@ struct DeviceRow: View {
                     .lineLimit(1)
             }
             Spacer()
-            if !d.clip && !d.localsend {
+            if !d.clip && !d.localsend && !d.airdrop {
                 Image(systemName: "doc.on.clipboard")
                     .foregroundStyle(.tertiary)
                     .help("Clipboard sync is off for this device")
@@ -328,7 +363,7 @@ struct DeviceRow: View {
         .contextMenu {
             Button("Send files...") { pick() }
             Button("Send clipboard") { Task { await m.sendClipboard(d) } }
-            if !d.localsend {
+            if !d.localsend && !d.airdrop {
                 Toggle("Sync clipboard", isOn: Binding(get: { d.clip }, set: { v in Task { await m.setClip(v, for: d) } }))
                 Divider()
                 Button("Forget") { Task { await m.forget(d) } }
@@ -414,6 +449,7 @@ struct RecentRow: View {
 
 @main
 struct DropApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var m = Model()
 
     var body: some Scene {

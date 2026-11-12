@@ -31,6 +31,7 @@ usage:
   drop forget <device>             remove a device
   drop autostart on|off            keep drop running in the background
   drop localsend [ask|always|off]  let LocalSend apps nearby see this device and send to it
+  drop airdrop <file>...           send files with AirDrop (macOS, opens the AirDrop picker)
   drop status | recent | stop
   drop daemon                      run the background service
 
@@ -62,6 +63,13 @@ fn main() {
         }
         return;
     }
+    if args.first().map(String::as_str) == Some("airdrop") {
+        if let Err(e) = airdrop(&args[1..]) {
+            eprintln!("drop: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match run(&args) {
         Ok(Some(req)) => match call(&req) {
             Ok(reply) => {
@@ -90,6 +98,24 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn airdrop(files: &[String]) -> Result<()> {
+    if files.is_empty() {
+        bail!("usage: drop airdrop <file>...");
+    }
+    if !cfg!(target_os = "macos") {
+        bail!("AirDrop is only on macOS");
+    }
+    let paths = files
+        .iter()
+        .map(|f| std::fs::canonicalize(f).with_context(|| format!("{f}: no such file")))
+        .collect::<Result<Vec<_>>>()?;
+    let ok = std::process::Command::new("open").args(["-b", "local.drop.menu"]).args(&paths).status()?.success();
+    if !ok {
+        bail!("could not reach Drop.app (install it with scripts/build-mac-app.sh)");
+    }
+    Ok(())
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
