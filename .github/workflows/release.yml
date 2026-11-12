@@ -9,13 +9,6 @@ permissions:
 
 jobs:
   mac:
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            arch: arm64
-          - target: x86_64-apple-darwin
-            arch: x86_64
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,16 +18,19 @@ jobs:
         run: |
           want=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           test "v$want" = "$GITHUB_REF_NAME"
-      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
-      - run: TARGET=${{ matrix.target }} ./scripts/build-mac-app.sh
-      - name: Package
+      - run: rustup toolchain install stable --profile minimal --target aarch64-apple-darwin --target x86_64-apple-darwin && rustup default stable
+      - name: Build and package both architectures
         run: |
           v=${GITHUB_REF_NAME#v}
           mkdir dist
-          tar -C target -czf "dist/hither-$v-macos-${{ matrix.arch }}.tar.gz" Hither.app
+          for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:x86_64; do
+            rm -rf target/Hither.app
+            TARGET=${pair%%:*} ./scripts/build-mac-app.sh
+            tar -C target -czf "dist/hither-$v-macos-${pair##*:}.tar.gz" Hither.app
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-${{ matrix.arch }}
+          name: macos
           path: dist/*
 
   linux:
