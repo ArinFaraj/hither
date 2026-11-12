@@ -85,8 +85,9 @@ jobs:
         env:
           RELEASE_KEY: ${{ secrets.HITHER_RELEASE_KEY }}
         run: |
+          cp assets/hither.apk dist/hither.apk
           cd dist
-          sha256sum hither-*.tar.gz > SHA256SUMS
+          sha256sum hither-*.tar.gz hither.apk > SHA256SUMS
           umask 077
           printf '%s\n' "$RELEASE_KEY" > "$RUNNER_TEMP/key.pem"
           pub=$(openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')

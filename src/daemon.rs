@@ -1318,7 +1318,7 @@ impl State {
             }
             Req::PairJoin { ticket } => {
                 let raw = data_encoding::BASE32_NOPAD
-                    .decode(ticket.trim().to_uppercase().as_bytes())
+                    .decode(ticket.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase().as_bytes())
                     .ok()
                     .filter(|r| r.len() == 40)
                     .context("that is not a hither pairing ticket")?;

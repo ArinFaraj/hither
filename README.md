@@ -56,7 +56,10 @@ xattr -dr com.apple.quarantine ~/Applications/Hither.app
 
 ### Android
 
-Turn on USB debugging, connect the phone, then:
+On a Mac, open the hither menu, click Add a device, pick Android phone and scan
+the QR code with the phone's camera. It downloads `hither.apk` from the latest
+release. Or download it from the releases page yourself, or turn on USB debugging,
+connect the phone and run:
 
 ```sh
 hither android install
@@ -75,6 +78,9 @@ hither send phone photo.jpg  # device names match by prefix
 hither clip on               # sync the clipboard with all paired devices
 hither airdrop               # AirDrop the clipboard (macOS)
 ```
+
+In the Mac menu, Add a device does the same with a ticket you can copy, and
+shows when the other computer has joined.
 
 Run `hither help` for every command. Add `--json` to any command for machine
 readable output.

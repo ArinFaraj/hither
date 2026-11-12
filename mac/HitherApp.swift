@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage.CIFilterBuiltins
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -10,11 +11,23 @@ struct Device: Identifiable, Hashable {
     let via: [String]
     let clip: Bool
     let phone: Bool
+    let adb: Bool
     let foreign: Bool
 
     var airdrop: Bool { id == AirDrop.id }
 
-    static let airdropRow = Device(id: AirDrop.id, name: "AirDrop", via: ["airdrop"], clip: true, phone: false, foreign: false)
+    static let airdropRow = Device(id: AirDrop.id, name: "AirDrop", via: ["airdrop"], clip: true, phone: false, adb: false, foreign: false)
+}
+
+enum QR {
+    static func image(_ text: String) -> NSImage? {
+        let f = CIFilter.qrCodeGenerator()
+        f.message = Data(text.utf8)
+        f.correctionLevel = "M"
+        guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)),
+              let cg = CIContext().createCGImage(out, from: out.extent) else { return nil }
+        return NSImage(cgImage: cg, size: out.extent.size)
+    }
 }
 
 enum AirDrop {
@@ -176,6 +189,13 @@ final class Model: ObservableObject {
     @Published var status: [String: String] = [:]
     @Published var ticket = ""
     @Published var pairMessage = ""
+    @Published var pairUntil: Date?
+    @Published var paired: String?
+    private var knownPeers: Set<String> = []
+
+    static let androidApp = "https://github.com/ArinFaraj/hither/releases/latest/download/hither.apk"
+
+    private var peers: [Device] { devices.filter { !$0.adb && !$0.foreign && !$0.airdrop } }
     @Published var loaded = false
     @Published var update: String?
     @Published var updating = false
@@ -198,11 +218,15 @@ final class Model: ObservableObject {
                 via: $0["via"] as? [String] ?? [],
                 clip: $0["clip"] as? Bool ?? true,
                 phone: serial != nil || $0["type"] as? String == "mobile",
+                adb: serial != nil,
                 foreign: serial == nil && !($0["id"] is String) && (ls != nil || $0["quickshare"] is String)
             )
         }
         if AirDrop.available { list.append(.airdropRow) }
         devices = list
+        if pairUntil != nil, paired == nil, let d = peers.first(where: { !knownPeers.contains($0.id) }) {
+            paired = d.name
+        }
         recent = (r["recent"] as? [[String: Any]] ?? []).prefix(5).map {
             Event(
                 kind: $0["kind"] as? String ?? "",
@@ -263,15 +287,33 @@ final class Model: ObservableObject {
     }
 
     func startPair() async {
+        if !loaded { await refresh() }
         pairMessage = ""
+        paired = nil
+        knownPeers = Set(peers.map(\.id))
         let r = await CLI.run(["pair"])
         ticket = r["ticket"] as? String ?? ""
+        let minutes = r["minutes"] as? Double ?? 10
+        pairUntil = ticket.isEmpty ? nil : Date().addingTimeInterval(minutes * 60)
+        if ticket.isEmpty { pairMessage = r["error"] as? String ?? "Could not make a ticket" }
+    }
+
+    func stopPair() {
+        pairUntil = nil
+        ticket = ""
+    }
+
+    func installAndroid(_ d: Device) async {
+        status[d.id] = "Installing..."
+        let r = await CLI.run(["android", "install", d.id])
+        flash(d, r["ok"] as? Bool == true ? "Installed, open Hither on the phone" : r["error"] as? String ?? "Install failed")
     }
 
     func join(_ t: String) async -> Bool {
-        let r = await CLI.run(["pair", t.trimmingCharacters(in: .whitespacesAndNewlines)])
+        let r = await CLI.run(["pair", t.filter { !$0.isWhitespace }])
         if r["ok"] as? Bool == true {
-            pairMessage = "Paired with \(r["device"] as? String ?? "device")"
+            pairMessage = ""
+            paired = r["device"] as? String ?? "the other computer"
             await refresh()
             return true
         }
@@ -284,6 +326,8 @@ struct Panel: View {
     @ObservedObject var m: Model
     @State private var pairing = false
     @State private var joinText = ""
+    @State private var tab = PairTab.computer
+    @State private var copied = false
     @State private var atLogin = SMAppService.mainApp.status == .enabled
     private let tick = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
@@ -307,7 +351,7 @@ struct Panel: View {
         .frame(width: 300)
         .task { await m.refresh() }
         .onReceive(tick) { _ in
-            if NSApp.keyWindow?.isVisible == true && !pairing { Task { await m.refresh() } }
+            if NSApp.keyWindow?.isVisible == true { Task { await m.refresh() } }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
             Task { await m.refresh() }
@@ -332,7 +376,7 @@ struct Panel: View {
                 Divider()
             }
             if m.devices.isEmpty {
-                Text(m.loaded ? "No devices yet. Pair one, or plug in a phone with USB debugging on." : "Starting...")
+                Text(m.loaded ? "No devices yet. Click Add a device below, or plug in a phone with USB debugging on." : "Starting...")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(14)
@@ -358,47 +402,160 @@ struct Panel: View {
     }
 
     private var pairView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("On the other device, run this or paste it there:")
-                .font(.callout)
-            HStack {
-                Text(m.ticket.isEmpty ? "..." : m.ticket)
-                    .font(.system(.caption, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                Spacer()
-                Button("Copy") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString("hither pair \(m.ticket)", forType: .string)
-                }
-                .disabled(m.ticket.isEmpty)
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("", selection: $tab) {
+                ForEach(PairTab.allCases, id: \.self) { Text($0.rawValue) }
             }
-            Text("Or join a device that showed you a ticket:")
-                .font(.callout)
-                .padding(.top, 4)
-            HStack {
-                TextField("ticket", text: $joinText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.caption, design: .monospaced))
-                Button("Join") {
-                    let t = joinText.replacingOccurrences(of: "hither pair", with: "")
-                    Task { if await m.join(t) { joinText = "" } }
-                }
-                .disabled(joinText.isEmpty)
-            }
-            if !m.pairMessage.isEmpty {
-                Text(m.pairMessage).font(.caption).foregroundStyle(.secondary)
-            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            if tab == .computer { computerPair } else { phonePair }
         }
         .padding(14)
     }
 
+    private static func lines(_ s: String, _ n: Int) -> String {
+        stride(from: 0, to: s.count, by: n).map { i in
+            String(s.dropFirst(i).prefix(n))
+        }.joined(separator: "\n")
+    }
+
+    @ViewBuilder
+    private var computerPair: some View {
+        if let name = m.paired {
+            VStack(spacing: 8) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 40))
+                    .foregroundStyle(.green)
+                Text("Paired with \(name)").font(.headline)
+                Text("Files and the clipboard can go between them now.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Pair another computer") { Task { await m.startPair() } }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Install hither on the other computer, then run:")
+                    .font(.callout)
+                HStack(alignment: .top, spacing: 6) {
+                    Text(m.ticket.isEmpty ? "..." : "hither pair\n" + Self.lines(m.ticket, 32))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString("hither pair \(m.ticket)", forType: .string)
+                        copied = true
+                        Task {
+                            try? await Task.sleep(for: .seconds(2))
+                            copied = false
+                        }
+                    } label: {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy")
+                    .disabled(m.ticket.isEmpty)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+                if let until = m.pairUntil {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        let left = Int(until.timeIntervalSince(ctx.date))
+                        if left > 0 {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Waiting for it. The ticket works once, for \(left / 60):\(String(format: "%02d", left % 60)).")
+                            }
+                        } else {
+                            HStack {
+                                Text("This ticket has expired.")
+                                Button("New ticket") { Task { await m.startPair() } }
+                                    .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Have a ticket from the other computer instead?")
+                    .font(.callout)
+                HStack {
+                    TextField("paste it here", text: $joinText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                    Button("Join") {
+                        let t = joinText.replacingOccurrences(of: "hither pair", with: "")
+                        Task { if await m.join(t) { joinText = "" } }
+                    }
+                    .disabled(joinText.isEmpty)
+                }
+            }
+            if !m.pairMessage.isEmpty {
+                Text(m.pairMessage).font(.caption).foregroundStyle(.red)
+            }
+        }
+    }
+
+    private var phonePair: some View {
+        VStack(spacing: 10) {
+            if let img = QR.image(Model.androidApp) {
+                Image(nsImage: img)
+                    .interpolation(.none)
+                    .resizable()
+                    .frame(width: 150, height: 150)
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(.white))
+            }
+            Text("Scan this with the phone's camera to download the Hither app. Android asks you to allow the install.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Then open Hither on the phone. On the same Wi-Fi it finds this Mac by itself.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            let usb = m.devices.filter { $0.adb && !$0.via.isEmpty }
+            if !usb.isEmpty {
+                Divider()
+                Text("Or install it over USB debugging:")
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                ForEach(usb) { d in
+                    HStack {
+                        Image(systemName: "iphone").foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(d.name)
+                            if let s = m.status[d.id] {
+                                Text(s).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                        }
+                        Spacer()
+                        Button("Install") { Task { await m.installAndroid(d) } }
+                            .disabled(m.status[d.id] == "Installing...")
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
     private var footer: some View {
         HStack {
-            Button(pairing ? "Done" : "Pair a device") {
+            Button(pairing ? "Done" : "Add a device") {
                 pairing.toggle()
-                if pairing { Task { await m.startPair() } }
+                if pairing { Task { await m.startPair() } } else { m.stopPair() }
             }
             Spacer()
             Menu {
@@ -420,6 +577,11 @@ struct Panel: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
     }
+}
+
+enum PairTab: String, CaseIterable {
+    case computer = "Computer"
+    case phone = "Android phone"
 }
 
 struct DeviceRow: View {
