@@ -53,6 +53,10 @@ pub struct Config {
     pub inbox: PathBuf,
     #[serde(default)]
     pub devices: Vec<Device>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub localsend: Option<crate::localsend::Mode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub localsend_trusted: Vec<String>,
 }
 
 impl Config {
@@ -66,6 +70,8 @@ impl Config {
             clip: true,
             inbox: default_inbox(),
             devices: Vec::new(),
+            localsend: None,
+            localsend_trusted: Vec::new(),
         };
         cfg.save()?;
         Ok(cfg)

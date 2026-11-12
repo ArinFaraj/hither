@@ -2,6 +2,7 @@ mod adb;
 mod autostart;
 mod clip;
 mod daemon;
+mod localsend;
 mod phone;
 mod proto;
 mod store;
@@ -29,6 +30,7 @@ usage:
   drop rename <device|.> <name>    rename a device (. is this one)
   drop forget <device>             remove a device
   drop autostart on|off            keep drop running in the background
+  drop localsend [ask|always|off]  let LocalSend apps nearby see this device and send to it
   drop status | recent | stop
   drop daemon                      run the background service
 
@@ -143,6 +145,8 @@ fn run(args: &[String]) -> Result<Option<Value>> {
         ["pair", ticket] => json!({"cmd": "pair_join", "ticket": ticket}),
         ["rename", dev, name @ ..] if !name.is_empty() => json!({"cmd": "rename", "device": dev, "name": name.join(" ")}),
         ["forget", dev] => json!({"cmd": "forget", "device": dev}),
+        ["localsend"] => json!({"cmd": "localsend"}),
+        ["localsend", m @ ("ask" | "always" | "off")] => json!({"cmd": "localsend", "mode": m}),
         _ => bail!("unknown command: {}", args.join(" ")),
     };
     Ok(Some(req))
@@ -220,7 +224,7 @@ fn print_human(req: &Value, r: &Value) {
             for d in list {
                 let via: Vec<String> = d["via"].as_array().into_iter().flatten().map(&s).collect();
                 let via = if via.is_empty() { "offline".to_string() } else { via.join(", ") };
-                let clip = if d["clip"] == true { "" } else { "  (clipboard off)" };
+                let clip = if d["clip"] == true || d["localsend"].is_string() { "" } else { "  (clipboard off)" };
                 println!("{:<24} {}{}", s(&d["name"]), via, clip);
             }
         }
@@ -260,6 +264,17 @@ fn print_human(req: &Value, r: &Value) {
         "pair_join" => println!("paired with {}", s(&r["device"])),
         "rename" => println!("{} is now {}", s(&r["old"]), s(&r["name"])),
         "forget" => println!("forgot {}", s(&r["forgot"])),
+        "localsend" => {
+            let mode = s(&r["mode"]);
+            match (mode.as_str(), r["running"] == true) {
+                ("off", _) => println!("localsend: off"),
+                (_, true) => println!("localsend: {mode}, listening on port {}", r["port"]),
+                (_, false) => println!("localsend: {mode}, not running ({})", s(&r["error"])),
+            }
+            for p in r["peers"].as_array().into_iter().flatten() {
+                println!("  {:<24} {}", s(&p["alias"]), s(&p["ip"]));
+            }
+        }
         _ => {}
     }
 }

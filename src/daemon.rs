@@ -1,6 +1,7 @@
 use crate::proto::{self, ALPN, Msg};
 use crate::store::{self, Config, Device};
 use crate::phone::{self, ClipEvent, Session};
+use crate::localsend::{self, LocalSend, Mode};
 use crate::{adb, clip};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, QuicTransportConfig, VarInt, presets};
@@ -34,6 +35,7 @@ pub enum Req {
     PairJoin { ticket: String },
     Rename { device: String, name: String },
     Forget { device: String },
+    Localsend { mode: Option<Mode> },
     Stop,
 }
 
@@ -47,7 +49,61 @@ pub struct State {
     adopt: tokio::sync::mpsc::UnboundedSender<Connection>,
     phones: Mutex<HashMap<String, Arc<Session>>>,
     clip_events: tokio::sync::mpsc::UnboundedSender<ClipEvent>,
+    ls: Mutex<Option<Arc<LocalSend>>>,
+    ls_error: Mutex<Option<String>>,
     me: std::sync::Weak<State>,
+}
+
+struct LsHost(std::sync::Weak<State>);
+
+impl localsend::Host for LsHost {
+    fn alias(&self) -> String {
+        self.0.upgrade().map(|s| s.cfg.lock().unwrap().name.clone()).unwrap_or_default()
+    }
+
+    fn inbox(&self) -> PathBuf {
+        self.0.upgrade().map(|s| s.cfg.lock().unwrap().inbox.clone()).unwrap_or_else(|| store::data_dir().join("inbox"))
+    }
+
+    fn mode(&self) -> Mode {
+        self.0.upgrade().map(|s| s.ls_mode()).unwrap_or(Mode::Off)
+    }
+
+    fn trusted(&self, fingerprint: &str) -> bool {
+        self.0.upgrade().is_some_and(|s| s.cfg.lock().unwrap().localsend_trusted.iter().any(|f| f == fingerprint))
+    }
+
+    fn trust(&self, fingerprint: &str) {
+        if let Some(s) = self.0.upgrade() {
+            let _ = s.update_cfg(|c| {
+                if !c.localsend_trusted.iter().any(|f| f == fingerprint) {
+                    c.localsend_trusted.push(fingerprint.to_string());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn received(&self, from: &str, path: &Path) {
+        if let Some(s) = self.0.upgrade() {
+            s.log("file_in", from, path.display().to_string());
+            notify(&format!("From {from}"), &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            eprintln!("got {} from {from} over LocalSend", path.display());
+        }
+    }
+
+    fn text(&self, from: &str, text: &str) {
+        let Some(s) = self.0.upgrade() else { return };
+        s.log("clip_in", from, format!("{} chars", text.chars().count()));
+        if clip::available() {
+            let t = text.to_string();
+            tokio::task::spawn_blocking(move || clip::set(&t));
+            notify(&format!("Copied text from {from}"), &text.chars().take(120).collect::<String>());
+        } else {
+            let inbox = s.cfg.lock().unwrap().inbox.clone();
+            let _ = std::fs::write(store::unique_path(&inbox, &format!("{from}.txt")), text);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -181,6 +237,8 @@ pub async fn run() -> Result<()> {
         adopt: adopt_tx,
         phones: Mutex::new(HashMap::new()),
         clip_events: clip_tx,
+        ls: Mutex::new(None),
+        ls_error: Mutex::new(None),
         me: me.clone(),
     });
     {
@@ -217,6 +275,7 @@ pub async fn run() -> Result<()> {
     if clip::available() {
         tokio::spawn(watch_clipboard(st.clone()));
     }
+    st.start_localsend().await;
 
     let listener = tokio::net::UnixListener::bind(&sock)?;
     #[cfg(unix)]
@@ -363,6 +422,58 @@ impl State {
                 }
             }
         }
+    }
+
+    fn ls_mode(&self) -> Mode {
+        self.cfg.lock().unwrap().localsend.unwrap_or_else(Mode::platform_default)
+    }
+
+    fn ls(&self) -> Option<Arc<LocalSend>> {
+        if self.ls_mode() == Mode::Off {
+            return None;
+        }
+        self.ls.lock().unwrap().clone()
+    }
+
+    async fn start_localsend(&self) {
+        if self.ls_mode() == Mode::Off || self.ls.lock().unwrap().is_some() {
+            return;
+        }
+        match LocalSend::start(Arc::new(LsHost(self.me.clone()))).await {
+            Ok(ls) => {
+                eprintln!("localsend on port {}", localsend::PORT);
+                *self.ls_error.lock().unwrap() = None;
+                *self.ls.lock().unwrap() = Some(ls);
+            }
+            Err(e) => {
+                eprintln!("localsend: {e:#}");
+                *self.ls_error.lock().unwrap() = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn ls_peer(&self, q: &str) -> Option<(Arc<LocalSend>, localsend::Peer)> {
+        let ls = self.ls()?;
+        let peer = ls.find(q)?;
+        Some((ls, peer))
+    }
+
+    async fn send_localsend(&self, ls: &LocalSend, peer: &localsend::Peer, paths: &[PathBuf]) -> Result<Value> {
+        for p in paths {
+            if !p.is_file() {
+                bail!("{} is not a file", p.display());
+            }
+        }
+        let started = Instant::now();
+        let sent = ls.send_files(peer, paths).await?;
+        let secs = started.elapsed().as_secs_f64();
+        let mut results = Vec::new();
+        for p in &sent {
+            let bytes = tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0);
+            self.log("file_out", &peer.alias, p.display().to_string());
+            results.push(json!({"file": p, "bytes": bytes, "secs": secs / sent.len() as f64, "via": format!("localsend {}", peer.ip), "dest": ""}));
+        }
+        Ok(json!({"device": peer.alias, "sent": results}))
     }
 
     fn session(&self, serial: &str) -> Option<Arc<Session>> {
@@ -603,11 +714,27 @@ impl State {
                         json!({"name": d.name, "id": d.id, "serial": d.serial, "clip": d.clip, "helper": live, "via": via})
                     })
                     .collect();
+                let mut list = list;
+                if let Some(ls) = self.ls() {
+                    ls.nudge();
+                    for p in ls.peers() {
+                        list.push(json!({
+                            "name": p.alias, "id": null, "serial": null, "clip": false, "helper": false,
+                            "via": [format!("localsend {}", p.ip)], "localsend": p.fingerprint, "type": p.device_type,
+                        }));
+                    }
+                }
                 Ok(json!({"devices": list}))
             }
             Req::Recent => Ok(json!({"recent": self.recent.lock().unwrap().iter().cloned().collect::<Vec<_>>()})),
             Req::Send { to, paths } => {
-                let (dev, phone) = self.resolve(&to).await?;
+                let (dev, phone) = match self.resolve(&to).await {
+                    Ok(r) => r,
+                    Err(e) => match self.ls_peer(&to) {
+                        Some((ls, peer)) => return self.send_localsend(&ls, &peer, &paths).await,
+                        None => return Err(e),
+                    },
+                };
                 let mut results = Vec::new();
                 for path in paths {
                     let started = Instant::now();
@@ -651,7 +778,16 @@ impl State {
                 Ok(json!({}))
             }
             Req::ClipSet { text, to: Some(to) } => {
-                let (dev, _) = self.resolve(&to).await?;
+                let dev = match self.resolve(&to).await {
+                    Ok((d, _)) => d,
+                    Err(e) => match self.ls_peer(&to) {
+                        Some((ls, peer)) => {
+                            ls.send_text(&peer, &text).await?;
+                            return Ok(json!({"device": peer.alias}));
+                        }
+                        None => return Err(e),
+                    },
+                };
                 if let Some(sess) = dev.serial.as_deref().and_then(|s| self.session(s)) {
                     sess.set_clip(&text).await?;
                 } else if dev.id.is_some() {
@@ -756,6 +892,27 @@ impl State {
                     }
                 }
                 Ok(json!({"forgot": d.name}))
+            }
+            Req::Localsend { mode } => {
+                if let Some(m) = mode {
+                    self.update_cfg(|c| {
+                        c.localsend = Some(m);
+                        Ok(())
+                    })?;
+                    self.start_localsend().await;
+                    if let Some(ls) = self.ls() {
+                        ls.nudge();
+                    }
+                }
+                let ls = self.ls();
+                Ok(json!({
+                    "mode": self.ls_mode(),
+                    "running": ls.is_some(),
+                    "error": if self.ls_mode() == Mode::Off { None } else { self.ls_error.lock().unwrap().clone() },
+                    "port": localsend::PORT,
+                    "fingerprint": ls.as_ref().map(|l| l.fingerprint().to_string()),
+                    "peers": ls.map(|l| l.peers()).unwrap_or_default(),
+                }))
             }
             Req::Stop => Ok(json!({})),
         }
