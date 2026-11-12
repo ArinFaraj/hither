@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.app.PendingIntent;
 import android.content.Intent;
@@ -10,7 +10,7 @@ public final class ClipTile extends TileService {
     public void onStartListening() {
         Tile t = getQsTile();
         if (t == null) return;
-        Peer p = Drop.target(this);
+        Peer p = Hither.target(this);
         t.setState(Tile.STATE_INACTIVE);
         t.setSubtitle(p == null ? "Pick a device" : "to " + p.alias);
         t.updateTile();

@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.app.job.JobInfo;
 import android.app.job.JobParameters;
@@ -30,7 +30,7 @@ public final class ShotJob extends JobService {
     }
 
     static void ensure(Context c) {
-        if (!Drop.screenshots(c)) return;
+        if (!Hither.screenshots(c)) return;
         if (c.checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES) != android.content.pm.PackageManager.PERMISSION_GRANTED) return;
         if (c.getSystemService(JobScheduler.class).getPendingJob(ID) == null) schedule(c);
     }
@@ -51,7 +51,7 @@ public final class ShotJob extends JobService {
                 }
             } finally {
                 jobFinished(params, false);
-                if (Drop.screenshots(this)) schedule(this);
+                if (Hither.screenshots(this)) schedule(this);
             }
         }).start();
         return true;

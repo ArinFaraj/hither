@@ -55,7 +55,7 @@ pub trait Host: Send + Sync + 'static {
     fn image(&self, from: &str, png: Vec<u8>);
 }
 
-pub const CLIP_IMAGE: &str = ".drop-clipboard.png";
+pub const CLIP_IMAGE: &str = ".hither-clipboard.png";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Peer {
@@ -164,7 +164,7 @@ fn identity() -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> 
     let key = rcgen::KeyPair::generate()?;
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params.distinguished_name.push(rcgen::DnType::CommonName, "drop");
+    params.distinguished_name.push(rcgen::DnType::CommonName, "hither");
     let cert = params.self_signed(&key)?;
     let (c, k) = (cert.der().to_vec(), key.serialize_der());
     std::fs::write(&cp, &c)?;
@@ -385,11 +385,10 @@ pub async fn ask(title: &str, text: &str, buttons: &[&str]) -> Option<String> {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let list = buttons.iter().map(|b| format!("\"{}\"", esc(b))).collect::<Vec<_>>().join(", ");
         let script = format!(
-            "display dialog \"{}\" with title \"{}\" buttons {{{}}} default button {} giving up after 120",
+            "display dialog \"{}\" with title \"{}\" buttons {{{}}} default button 1 cancel button 1 giving up after 120",
             esc(text),
             esc(title),
-            list,
-            buttons.len()
+            list
         );
         let out = tokio::process::Command::new("osascript").args(["-e", &script]).output().await.ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
@@ -560,8 +559,38 @@ impl LocalSend {
             model: info.device_model.clone(),
             seen: Instant::now(),
         };
-        self.peers.lock().unwrap().insert(fp, peer.clone());
+        let mut peers = self.peers.lock().unwrap();
+        if let Some(old) = peers.get(&fp) {
+            if old.https && !peer.https && old.seen.elapsed() < FRESH {
+                return old.clone();
+            }
+        }
+        peers.insert(fp, peer.clone());
         peer
+    }
+
+    async fn verify(&self, ip: IpAddr, cert_fp: Option<String>, info: &Info) -> Option<String> {
+        if cert_fp.is_some() {
+            return cert_fp;
+        }
+        if info.protocol == "http" || info.fingerprint.is_empty() {
+            return None;
+        }
+        let peer = Peer {
+            alias: info.alias.clone(),
+            fingerprint: info.fingerprint.clone(),
+            ip,
+            port: info.port,
+            https: true,
+            device_type: None,
+            model: None,
+            seen: Instant::now(),
+        };
+        let ok = self
+            .http(&peer, Method::GET, &format!("{API}/info"), json_body(Vec::new()), None, Duration::from_secs(3))
+            .await
+            .is_ok_and(|(s, _)| s.is_success());
+        ok.then(|| info.fingerprint.clone())
     }
 
     pub fn peers(&self) -> Vec<Peer> {
@@ -609,29 +638,32 @@ impl LocalSend {
 
     async fn on_register(&self, ip: IpAddr, cert_fp: Option<String>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let info: Info = read_json(req.into_body(), 1 << 16).await?;
-        let fp = cert_fp.unwrap_or_else(|| info.fingerprint.clone());
-        self.remember(&info, ip, fp);
+        if let Some(fp) = self.verify(ip, cert_fp, &info).await {
+            self.remember(&info, ip, fp);
+        }
         Ok(reply(StatusCode::OK, Some(json!(self.info(None)))))
     }
 
     async fn on_prepare(&self, ip: IpAddr, cert_fp: Option<String>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let p: PrepareReq = read_json(req.into_body(), 16 << 20).await?;
-        let fp = cert_fp.unwrap_or_else(|| p.info.fingerprint.clone());
+        let verified = self.verify(ip, cert_fp, &p.info).await;
         let from = p.info.alias.clone();
-        self.remember(&p.info, ip, fp.clone());
+        if let Some(fp) = &verified {
+            self.remember(&p.info, ip, fp.clone());
+        }
         if let Some(u) = self.session.lock().unwrap().as_ref() {
             if u.touched.elapsed() < Duration::from_secs(600) {
                 return Ok(reply(StatusCode::CONFLICT, Some(json!({"message": "Blocked by another session"}))));
             }
         }
-        let trusted = self.host.trusted(&fp) || self.host.mode() == Mode::Always;
+        let trusted = verified.as_deref().is_some_and(|fp| self.host.trusted(fp)) || self.host.mode() == Mode::Always;
         if p.files.len() == 1 {
             let f = p.files.values().next().unwrap();
             if f.file_type.starts_with("text/") && f.preview.is_some() {
                 let text = f.preview.clone().unwrap_or_default();
                 let take = trusted || {
                     let shown: String = text.chars().take(300).collect();
-                    ask("drop", &format!("{from} sent you text:\n\n{shown}"), &["Ignore", "Copy"]).await.as_deref() == Some("Copy")
+                    ask("Hither", &format!("{from} sent you text:\n\n{shown}"), &["Ignore", "Copy"]).await.as_deref() == Some("Copy")
                 };
                 if take {
                     self.host.text(&from, &text);
@@ -645,7 +677,7 @@ impl LocalSend {
             if p.files.values().next().is_some_and(|f| f.size > crate::clip::MAX_IMAGE) {
                 return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, Some(json!({"message": "Image too large"}))));
             }
-            if !trusted && ask("drop", &format!("{from} sent you an image for the clipboard"), &["Ignore", "Copy"]).await.as_deref() != Some("Copy") {
+            if !trusted && ask("Hither", &format!("{from} sent you an image for the clipboard"), &["Ignore", "Copy"]).await.as_deref() != Some("Copy") {
                 return Ok(reply(StatusCode::FORBIDDEN, Some(json!({"message": "Rejected"}))));
             }
         } else if !trusted {
@@ -654,10 +686,21 @@ impl LocalSend {
             names.sort();
             let shown = if names.len() > 4 { format!("{}, and {} more", names[..4].join(", "), names.len() - 4) } else { names.join(", ") };
             let what = if p.files.len() == 1 { "a file".to_string() } else { format!("{} files", p.files.len()) };
-            let msg = format!("{from} wants to send you {what} ({}):\n\n{shown}", human(total));
-            match ask("drop", &msg, &["Decline", "Always accept", "Accept"]).await.as_deref() {
+            let mut msg = format!("{from} wants to send you {what} ({}):\n\n{shown}", human(total));
+            let buttons: &[&str] = match verified {
+                Some(_) => &["Decline", "Always accept", "Accept"],
+                None => {
+                    msg.push_str("\n\nThis device could not prove who it is.");
+                    &["Decline", "Accept"]
+                }
+            };
+            match ask("Hither", &msg, buttons).await.as_deref() {
                 Some("Accept") => {}
-                Some("Always accept") => self.host.trust(&fp),
+                Some("Always accept") => {
+                    if let Some(fp) = &verified {
+                        self.host.trust(fp);
+                    }
+                }
                 _ => return Ok(reply(StatusCode::FORBIDDEN, Some(json!({"message": "Rejected"})))),
             }
         }

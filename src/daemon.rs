@@ -5,6 +5,7 @@ use crate::localsend::{self, LocalSend, Mode};
 use crate::quickshare::{self, QuickShare};
 use crate::clip::{self, Clip};
 use crate::adb;
+use crate::update;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -17,9 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-const APK: &[u8] = include_bytes!("../assets/drop.apk");
+const APK: &[u8] = include_bytes!("../assets/hither.apk");
 const PAIR_WINDOW: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const RESTART: i32 = 75;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -44,6 +46,8 @@ pub enum Req {
     Quickshare { mode: Option<Mode> },
     Screenshots { on: Option<bool> },
     AndroidInstall { device: Option<String> },
+    Updates { mode: Option<update::Mode> },
+    Restart,
     Stop,
 }
 
@@ -61,6 +65,7 @@ pub struct State {
     ls_error: Mutex<Option<String>>,
     qs: Mutex<Option<Arc<QuickShare>>>,
     qs_error: Mutex<Option<String>>,
+    update: Mutex<Option<update::Release>>,
     me: std::sync::Weak<State>,
 }
 
@@ -124,7 +129,7 @@ impl localsend::Host for LsHost {
             tokio::task::spawn_blocking(move || {
                 let Clip::Image(b) = &c else { return };
                 let Some(png) = clip::to_png(b) else { return };
-                let thumb = std::env::temp_dir().join("drop-clipboard.png");
+                let thumb = std::env::temp_dir().join("hither-clipboard.png");
                 let shown = std::fs::write(&thumb, &png).is_ok();
                 clip::set(&Clip::Image(png));
                 notify(&format!("Clipboard from {from}"), "Image copied, ready to paste", if shown { Note::Image(&thumb) } else { Note::Plain });
@@ -185,7 +190,16 @@ impl ProtocolHandler for Handler {
 
 async fn serve_conn(st: Arc<State>, conn: Connection) {
     let peer = conn.remote_id();
-    if st.device_by_id(&peer).is_some() {
+    if st.device_by_id(&peer).is_none() {
+        if let Ok(Ok((send, recv))) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi()).await {
+            if let Err(e) = st.serve_stream(peer, send, recv).await {
+                eprintln!("stream from {}: {e:#}", peer.fmt_short());
+            }
+        }
+        conn.close(0u32.into(), b"bye");
+        return;
+    }
+    {
         let mut conns = st.conns.lock().await;
         if conns.get(&peer).is_none_or(|c| c.close_reason().is_some()) {
             conns.insert(peer, conn.clone());
@@ -249,7 +263,7 @@ pub async fn run() -> Result<()> {
     store::menu_key()?;
     let sock = store::sock_path();
     if tokio::net::UnixStream::connect(&sock).await.is_ok() {
-        eprintln!("drop is already running");
+        eprintln!("hither is already running");
         return Ok(());
     }
     let _ = std::fs::remove_file(&sock);
@@ -270,7 +284,7 @@ pub async fn run() -> Result<()> {
         .await
         .map_err(|e| anyhow!("{e}"))?;
     match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
-        .service_name("drop")
+        .service_name("hither")
         .discovery_cadence(Duration::from_secs(30))
         .build(ep.id()) {
         Ok(mdns) => match ep.address_lookup() {
@@ -296,6 +310,7 @@ pub async fn run() -> Result<()> {
         ls_error: Mutex::new(None),
         qs: Mutex::new(None),
         qs_error: Mutex::new(None),
+        update: Mutex::new(None),
         me: me.clone(),
     });
     {
@@ -327,7 +342,7 @@ pub async fn run() -> Result<()> {
         });
     }
     let router = Router::builder(ep).accept(ALPN, Handler(st.clone())).spawn();
-    eprintln!("drop {} as \"{}\"", st.ep.id(), st.cfg.lock().unwrap().name);
+    eprintln!("hither {} as \"{}\"", st.ep.id(), st.cfg.lock().unwrap().name);
 
     if clip::available() {
         tokio::spawn(watch_clipboard(st.clone()));
@@ -338,6 +353,7 @@ pub async fn run() -> Result<()> {
     tokio::spawn(watch_screenshots(st.clone()));
     st.start_localsend().await;
     st.start_quickshare().await;
+    tokio::spawn(watch_updates(st.clone()));
 
     let listener = tokio::net::UnixListener::bind(&sock)?;
     #[cfg(unix)]
@@ -375,6 +391,69 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+async fn watch_updates(st: Arc<State>) {
+    if update::dev_build() {
+        return;
+    }
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let mut told = String::new();
+    loop {
+        let mode = st.cfg.lock().unwrap().updates;
+        if mode != update::Mode::Off {
+            match tokio::task::spawn_blocking(update::check).await {
+                Ok(Ok(Some(r))) => {
+                    let v = r.version().to_string();
+                    *st.update.lock().unwrap() = Some(r.clone());
+                    if mode == update::Mode::Auto {
+                        match tokio::task::spawn_blocking(move || update::install(&r, false)).await {
+                            Ok(Ok(_)) => {
+                                eprintln!("updated to {v}, restarting");
+                                notify("Hither updated", &format!("Now running {v}"), Note::Plain);
+                                tokio::task::spawn_blocking(update::restart_menu).await.ok();
+                                let _ = std::fs::remove_file(store::sock_path());
+                                std::process::exit(RESTART);
+                            }
+                            Ok(Err(e)) => eprintln!("update to {v}: {e:#}"),
+                            Err(e) => eprintln!("update to {v}: {e}"),
+                        }
+                    } else if told != v {
+                        notify("Hither update", &format!("Version {v} is out. Run `hither update` or use the menu."), Note::Plain);
+                        told = v;
+                    }
+                }
+                Ok(Ok(None)) => *st.update.lock().unwrap() = None,
+                Ok(Err(e)) => eprintln!("update check: {e:#}"),
+                Err(e) => eprintln!("update check: {e}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+    }
+}
+
+async fn upgrade_app(name: String, transport: String) {
+    let Ok(out) = adb::shell(&transport, "dumpsys package hither.android | grep -m1 versionCode=").await else { return };
+    let Some(code) = out
+        .split("versionCode=")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    if code >= update::android_version_code() {
+        return;
+    }
+    let apk = store::data_dir().join(format!("hither-{}.apk", transport.replace(|c: char| !c.is_ascii_alphanumeric(), "_")));
+    if tokio::fs::write(&apk, APK).await.is_err() {
+        return;
+    }
+    match adb::install(&transport, &apk).await {
+        Ok(()) => eprintln!("updated the hither app on {name}"),
+        Err(e) => eprintln!("updating the hither app on {name}: {e:#}"),
+    }
+    let _ = tokio::fs::remove_file(&apk).await;
+}
+
 async fn serve_local(
     st: Arc<State>,
     stream: tokio::net::UnixStream,
@@ -386,6 +465,14 @@ async fn serve_local(
         let reply = match serde_json::from_str::<Req>(&line) {
             Ok(Req::Stop) => {
                 let _ = stop.send(()).await;
+                json!({"ok": true})
+            }
+            Ok(Req::Restart) => {
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = std::fs::remove_file(store::sock_path());
+                    std::process::exit(RESTART);
+                });
                 json!({"ok": true})
             }
             Ok(req) => match st.handle(req).await {
@@ -746,6 +833,7 @@ impl State {
             match Session::start(&p.serial, &p.transport, self.clip_events.clone()).await {
                 Ok(sess) => {
                     eprintln!("helper running on {} via {}", p.name, p.transport);
+                    tokio::spawn(upgrade_app(p.name.clone(), p.transport.clone()));
                     self.phones.lock().unwrap().insert(p.serial.clone(), sess);
                 }
                 Err(e) => {
@@ -781,7 +869,7 @@ impl State {
         }
         let c = tokio::time::timeout(CONNECT_TIMEOUT, self.ep.connect(EndpointAddr::from(id), ALPN))
             .await
-            .map_err(|_| anyhow!("device did not answer (is drop running there?)"))?
+            .map_err(|_| anyhow!("device did not answer (is hither running there?)"))?
             .map_err(|e| anyhow!("connect: {e}"))?;
         conns.insert(id, c.clone());
         let _ = self.adopt.send(c.clone());
@@ -815,7 +903,7 @@ impl State {
         s.write_all(bytes).await?;
         s.finish()?;
         match proto::read::<_, Msg>(&mut r).await? {
-            Msg::Err { error } if error.starts_with("unexpected") => bail!("{} runs an older drop without image clipboard", d.name),
+            Msg::Err { error } if error.starts_with("unexpected") => bail!("{} runs an older hither without image clipboard", d.name),
             Msg::Err { error } => bail!(error),
             _ => Ok(()),
         }
@@ -961,6 +1049,9 @@ impl State {
                     "adb": adb::adb_path(),
                     "addr": serde_json::to_value(self.ep.addr()).ok(),
                     "devices": cfg.devices.len(),
+                    "version": update::VERSION,
+                    "update": self.update.lock().unwrap().as_ref().map(|r| r.version().to_string()),
+                    "updates": cfg.updates,
                 }))
             }
             Req::Devices => {
@@ -1082,7 +1173,7 @@ impl State {
                 if bytes.len() as u64 > clip::MAX_IMAGE {
                     bail!("image is too large");
                 }
-                let png = tokio::task::spawn_blocking(move || clip::to_png(&bytes)).await?.context("that file is not an image drop can read")?;
+                let png = tokio::task::spawn_blocking(move || clip::to_png(&bytes)).await?.context("that file is not an image hither can read")?;
                 let c = Clip::Image(png);
                 let Some(to) = to else {
                     if !clip::available() {
@@ -1112,11 +1203,11 @@ impl State {
                         match phones.len() {
                             0 => bail!("no phone is connected over adb"),
                             1 => phones.remove(0),
-                            _ => bail!("more than one phone is connected, name one: drop android install <device>"),
+                            _ => bail!("more than one phone is connected, name one: hither android install <device>"),
                         }
                     }
                 };
-                let apk = store::data_dir().join("drop.apk");
+                let apk = store::data_dir().join("hither.apk");
                 tokio::fs::write(&apk, APK).await?;
                 let r = adb::install(&phone.transport, &apk).await;
                 let _ = tokio::fs::remove_file(&apk).await;
@@ -1230,7 +1321,7 @@ impl State {
                     .decode(ticket.trim().to_uppercase().as_bytes())
                     .ok()
                     .filter(|r| r.len() == 40)
-                    .context("that is not a drop pairing ticket")?;
+                    .context("that is not a hither pairing ticket")?;
                 let id = EndpointId::from_bytes(raw[..32].try_into()?)?;
                 if id == self.ep.id() {
                     bail!("that ticket is from this device");
@@ -1317,7 +1408,20 @@ impl State {
                     "name": qs.map(|q| q.name.clone()),
                 }))
             }
-            Req::Stop => Ok(json!({})),
+            Req::Updates { mode } => {
+                if let Some(mode) = mode {
+                    self.update_cfg(|c| {
+                        c.updates = mode;
+                        Ok(())
+                    })?;
+                }
+                Ok(json!({
+                    "updates": self.cfg.lock().unwrap().updates,
+                    "version": update::VERSION,
+                    "update": self.update.lock().unwrap().as_ref().map(|r| r.version().to_string()),
+                }))
+            }
+            Req::Stop | Req::Restart => Ok(json!({})),
         }
     }
 
@@ -1336,7 +1440,7 @@ impl State {
         if let Some(p) = phone {
             return Ok((format!("adb {}", p.transport), adb::push(&p.transport, path).await?));
         }
-        bail!("{} is not reachable right now (no drop app and no adb connection)", dev.name)
+        bail!("{} is not reachable right now (no hither app and no adb connection)", dev.name)
     }
 
     async fn send_net(&self, id: EndpointId, path: &Path, size: u64) -> Result<(String, String)> {
@@ -1391,7 +1495,7 @@ fn notify(title: &str, body: &str, note: Note) {
                 .collect::<String>()
         };
         let key = store::menu_key().unwrap_or_default();
-        let mut url = format!("dropmenu://notify?key={key}&title={}&body={}", enc(title), enc(body));
+        let mut url = format!("hither://notify?key={key}&title={}&body={}", enc(title), enc(body));
         match note {
             Note::Plain => {}
             Note::File(p) => url += &format!("&file={}", enc(&p.to_string_lossy())),

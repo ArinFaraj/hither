@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN: &[u8] = b"drop/1";
+pub const ALPN: &[u8] = b"hither/1";
 const MAX_FRAME: usize = 16 << 20;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]

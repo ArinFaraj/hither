@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.content.Context;
 import android.net.Uri;
@@ -72,11 +72,11 @@ final class LocalSend {
 
     private static JSONObject info(Context c, int port) throws JSONException {
         JSONObject o = new JSONObject();
-        o.put("alias", Drop.name(c));
+        o.put("alias", Hither.name(c));
         o.put("version", "2.1");
         o.put("deviceModel", Build.MODEL);
         o.put("deviceType", "mobile");
-        o.put("fingerprint", Drop.fingerprint(c));
+        o.put("fingerprint", Hither.fingerprint(c));
         o.put("port", port);
         o.put("protocol", "http");
         o.put("download", false);
@@ -102,11 +102,11 @@ final class LocalSend {
 
     static void discover(Context c, long millis, Found cb) throws IOException {
         WifiManager wm = (WifiManager) c.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        WifiManager.MulticastLock lock = wm.createMulticastLock("drop");
+        WifiManager.MulticastLock lock = wm.createMulticastLock("hither");
         lock.setReferenceCounted(false);
         lock.acquire();
         Set<String> seen = Collections.synchronizedSet(new HashSet<>());
-        String me = Drop.fingerprint(c);
+        String me = Hither.fingerprint(c);
         ServerSocket server = new ServerSocket(0);
         Thread http = null;
         try (MulticastSocket ms = new MulticastSocket(null)) {
@@ -220,7 +220,7 @@ final class LocalSend {
             HttpsURLConnection hc = (HttpsURLConnection) c;
             try {
                 SSLContext ctx = SSLContext.getInstance("TLS");
-                ctx.init(null, new TrustManager[] {new Pinned(p.fingerprint)}, null);
+                ctx.init(Identity.get().keyManagers(), new TrustManager[] {new Pinned(p.fingerprint)}, null);
                 hc.setSSLSocketFactory(ctx.getSocketFactory());
             } catch (Exception e) {
                 throw new IOException(e);

@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.Manifest;
 import android.app.Activity;
@@ -28,12 +28,12 @@ public final class MainActivity extends Activity {
 
         TextView title = new TextView(this);
         title.setTextAppearance(android.R.style.TextAppearance_DeviceDefault_Large);
-        title.setText("drop");
+        title.setText("Hither");
         root.addView(title);
 
         TextView about = new TextView(this);
         about.setPadding(0, pad / 2, 0, pad);
-        about.setText("This phone shows up as \"" + Drop.name(this) + "\". Share anything and pick drop, "
+        about.setText("This phone shows up as \"" + Hither.name(this) + "\". Share anything and pick hither, "
                 + "or use the Send clipboard tile in Quick Settings.");
         root.addView(about);
 
@@ -60,7 +60,7 @@ public final class MainActivity extends Activity {
                 requestPermissions(new String[] {Manifest.permission.READ_MEDIA_IMAGES}, 1);
                 return;
             }
-            Drop.setScreenshots(this, on);
+            Hither.setScreenshots(this, on);
         });
         root.addView(shots);
 
@@ -70,15 +70,15 @@ public final class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
-        Drop.setScreenshots(this, ok);
+        Hither.setScreenshots(this, ok);
         shots.setChecked(ok);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        Peer p = Drop.target(this);
+        Peer p = Hither.target(this);
         target.setText(p == null ? "Tile sends to: not chosen yet" : "Tile sends to: " + p.alias);
-        shots.setChecked(Drop.screenshots(this));
+        shots.setChecked(Hither.screenshots(this));
     }
 }

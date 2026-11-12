@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag matches Cargo.toml
+        run: |
+          want=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$want" = "$GITHUB_REF_NAME"
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - run: TARGET=${{ matrix.target }} ./scripts/build-mac-app.sh
+      - name: Package
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          mkdir dist
+          tar -C target -czf "dist/hither-$v-macos-${{ matrix.arch }}.tar.gz" Hither.app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - name: Build
+        run: |
+          export "CC_$(echo ${{ matrix.target }} | tr - _)=musl-gcc"
+          cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          mkdir dist
+          tar -C target/${{ matrix.target }}/release -czf "dist/hither-$v-linux-${{ matrix.arch }}.tar.gz" hither
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  publish:
+    needs: [mac, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Sign
+        env:
+          RELEASE_KEY: ${{ secrets.HITHER_RELEASE_KEY }}
+        run: |
+          cd dist
+          sha256sum hither-*.tar.gz > SHA256SUMS
+          umask 077
+          printf '%s\n' "$RELEASE_KEY" > "$RUNNER_TEMP/key.pem"
+          pub=$(openssl pkey -in "$RUNNER_TEMP/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+          grep -q "const RELEASE_KEY: &str = \"$pub\"" ../src/update.rs
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm "$RUNNER_TEMP/key.pem"
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "hither ${GITHUB_REF_NAME#v}" --generate-notes

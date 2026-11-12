@@ -1,4 +1,4 @@
-package drop;
+package hither;
 
 import android.content.ClipData;
 import android.content.IOnPrimaryClipChangedListener;
@@ -23,7 +23,7 @@ public final class Helper {
     private static Method inject;
     private static volatile String lastSet;
     private static volatile String lastImage;
-    private static final String OWN = "drop.android.clip";
+    private static final String OWN = "hither.android.clip";
     private static final PrintStream out = new PrintStream(System.out, true);
 
     public static void main(String[] args) throws Exception {
@@ -135,7 +135,7 @@ public final class Helper {
 
     private static void setClip(String text) throws Exception {
         lastSet = text;
-        call("setPrimaryClip", ClipData.newPlainText("drop", text));
+        call("setPrimaryClip", ClipData.newPlainText("hither", text));
     }
 
     private static String imageUri(ClipData clip) {

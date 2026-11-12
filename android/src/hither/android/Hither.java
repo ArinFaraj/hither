@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -8,13 +8,11 @@ import android.provider.Settings;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.security.SecureRandom;
-
-final class Drop {
-    private Drop() {}
+final class Hither {
+    private Hither() {}
 
     static SharedPreferences prefs(Context c) {
-        return c.getSharedPreferences("drop", Context.MODE_PRIVATE);
+        return c.getSharedPreferences("hither", Context.MODE_PRIVATE);
     }
 
     static String name(Context c) {
@@ -23,17 +21,11 @@ final class Drop {
     }
 
     static String fingerprint(Context c) {
-        SharedPreferences p = prefs(c);
-        String fp = p.getString("fingerprint", null);
-        if (fp == null) {
-            byte[] b = new byte[32];
-            new SecureRandom().nextBytes(b);
-            StringBuilder sb = new StringBuilder();
-            for (byte x : b) sb.append(String.format("%02X", x));
-            fp = sb.toString();
-            p.edit().putString("fingerprint", fp).apply();
+        try {
+            return Identity.get().fingerprint;
+        } catch (java.security.GeneralSecurityException e) {
+            throw new IllegalStateException("no LocalSend identity", e);
         }
-        return fp;
     }
 
     static Peer target(Context c) {

@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -23,7 +23,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 
 public final class ClipProvider extends ContentProvider {
-    static final String AUTHORITY = "drop.android.clip";
+    static final String AUTHORITY = "hither.android.clip";
     private static final long MAX = 40L << 20;
     private static final int SHELL_UID = 2000;
 
@@ -49,9 +49,9 @@ public final class ClipProvider extends ContentProvider {
             ClipboardManager cm = c.getSystemService(ClipboardManager.class);
             try {
                 cm.setPrimaryClip(ClipData.newUri(c.getContentResolver(), label, u));
-                android.util.Log.i("drop", "clipboard set to " + u);
+                android.util.Log.i("hither", "clipboard set to " + u);
             } catch (RuntimeException e) {
-                android.util.Log.w("drop", "setting the clipboard failed", e);
+                android.util.Log.w("hither", "setting the clipboard failed", e);
             }
         });
     }
@@ -114,17 +114,17 @@ public final class ClipProvider extends ContentProvider {
                     out.write(buf, 0, n);
                 }
                 ok = total > 0;
-                android.util.Log.i("drop", "clip in: " + total + " bytes");
+                android.util.Log.i("hither", "clip in: " + total + " bytes");
             } catch (IOException e) {
-                android.util.Log.w("drop", "clip in failed", e);
+                android.util.Log.w("hither", "clip in failed", e);
             }
             if (!ok || !tmp.renameTo(new File(d, name))) {
-                android.util.Log.w("drop", "clip in: nothing saved");
+                android.util.Log.w("hither", "clip in: nothing saved");
                 tmp.delete();
                 return;
             }
             keepNewest(d, 4);
-            setClip(c, uri("in", name), "drop");
+            setClip(c, uri("in", name), "hither");
         }).start();
         return pipe[1];
     }

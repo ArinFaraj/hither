@@ -16,14 +16,20 @@ func render(_ px: Int) -> Data {
                ending: NSColor(srgbRed: 0.10, green: 0.36, blue: 0.90, alpha: 1))!.draw(in: bg, angle: -90)
     let u = tile.width / 72
     func p(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: tile.minX + (x - 18) * u, y: tile.maxY - (y - 18) * u) }
-    let drop = NSBezierPath()
-    drop.move(to: p(54, 30))
-    drop.curve(to: p(38, 60), controlPoint1: p(54, 30), controlPoint2: p(38, 48))
-    drop.appendArc(withCenter: p(54, 60), radius: 16 * u, startAngle: 180, endAngle: 360, clockwise: false)
-    drop.curve(to: p(54, 30), controlPoint1: p(70, 48), controlPoint2: p(54, 30))
-    drop.close()
-    NSColor.white.setFill()
-    drop.fill()
+    NSColor.white.set()
+    let arrows = NSBezierPath()
+    for (a, b, c) in [((44, 32), (54, 42), (64, 32)), ((44, 76), (54, 66), (64, 76)),
+                      ((32, 44), (42, 54), (32, 64)), ((76, 44), (66, 54), (76, 64))] as [((CGFloat, CGFloat), (CGFloat, CGFloat), (CGFloat, CGFloat))] {
+        arrows.move(to: p(a.0, a.1))
+        arrows.line(to: p(b.0, b.1))
+        arrows.line(to: p(c.0, c.1))
+    }
+    arrows.lineWidth = 6 * u
+    arrows.lineCapStyle = .round
+    arrows.lineJoinStyle = .round
+    arrows.stroke()
+    let c = p(54, 54)
+    NSBezierPath(ovalIn: NSRect(x: c.x - 7 * u, y: c.y - 7 * u, width: 14 * u, height: 14 * u)).fill()
     NSGraphicsContext.restoreGraphicsState()
     return rep.representation(using: .png, properties: [:])!
 }

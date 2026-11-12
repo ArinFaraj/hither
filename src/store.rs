@@ -3,17 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub fn data_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("DROP_HOME") {
+    if let Ok(d) = std::env::var("HITHER_HOME") {
         return PathBuf::from(d);
     }
     let home = home();
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/drop")
+        home.join("Library/Application Support/hither")
     } else {
         std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.join(".local/share"))
-            .join("drop")
+            .join("hither")
     }
 }
 
@@ -25,7 +25,7 @@ pub fn home() -> PathBuf {
 }
 
 pub fn sock_path() -> PathBuf {
-    data_dir().join("drop.sock")
+    data_dir().join("hither.sock")
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -59,6 +59,8 @@ pub struct Config {
     pub localsend_trusted: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshots: Option<bool>,
+    #[serde(default)]
+    pub updates: crate::update::Mode,
 }
 
 impl Config {
@@ -76,6 +78,7 @@ impl Config {
             quickshare: None,
             localsend_trusted: Vec::new(),
             screenshots: None,
+            updates: Default::default(),
         };
         cfg.save()?;
         Ok(cfg)
@@ -107,7 +110,7 @@ impl Config {
                 _ => anyhow::bail!("\"{query}\" matches more than one device"),
             }
         }
-        anyhow::bail!("no device called \"{query}\" (see `drop devices`)")
+        anyhow::bail!("no device called \"{query}\" (see `hither devices`)")
     }
 }
 
@@ -206,7 +209,7 @@ mod tests {
 
     #[test]
     fn reserve_never_hands_out_the_same_name_twice() {
-        let dir = std::env::temp_dir().join(format!("drop-reserve-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hither-reserve-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (a, _, _) = reserve(&dir, "photo.jpg").unwrap();
         let (b, _, _) = reserve(&dir, "photo.jpg").unwrap();

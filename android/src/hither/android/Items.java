@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.content.ClipData;
 import android.content.Context;
@@ -19,8 +19,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 final class Items {
-    static final String CLIP_IMAGE = ".drop-clipboard.png";
-    static final String CLIP_TEXT = ".drop-clipboard.txt";
+    static final String CLIP_IMAGE = ".hither-clipboard.png";
+    static final String CLIP_TEXT = ".hither-clipboard.txt";
 
     private Items() {}
 

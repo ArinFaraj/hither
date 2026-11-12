@@ -138,7 +138,7 @@ pub async fn write_uri(transport: &str, uri: &str, data: &[u8]) -> Result<()> {
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if !out.status.success() || said.contains("Exception") || said.contains("Could not find provider") {
         if said.contains("provider") {
-            bail!("the drop app is not installed on the phone (run: drop android install)");
+            bail!("the hither app is not installed on the phone (run: hither android install)");
         }
         bail!("writing {uri}: {}", said.trim());
     }
@@ -147,7 +147,7 @@ pub async fn write_uri(transport: &str, uri: &str, data: &[u8]) -> Result<()> {
 
 pub async fn install(transport: &str, apk: &Path) -> Result<()> {
     run(&["-s", transport, "install", "-r", "-g", &apk.to_string_lossy()]).await?;
-    let _ = run(&["-s", transport, "shell", "content", "query", "--uri", "content://drop.android.clip/start"]).await;
+    let _ = run(&["-s", transport, "shell", "content", "query", "--uri", "content://hither.android.clip/start"]).await;
     Ok(())
 }
 
@@ -164,7 +164,7 @@ pub async fn type_text(transport: &str, text: &str) -> Result<()> {
             continue;
         }
         if !line.is_ascii() {
-            bail!("adb can only type plain ASCII and the drop helper is not running on the phone");
+            bail!("adb can only type plain ASCII and the hither helper is not running on the phone");
         }
         let escaped: String = line
             .chars()

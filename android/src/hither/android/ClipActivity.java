@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.app.Activity;
 import android.content.ClipboardManager;
@@ -29,7 +29,7 @@ public final class ClipActivity extends Activity {
             finish();
             return;
         }
-        Peer target = Drop.target(this);
+        Peer target = Hither.target(this);
         if (target == null) {
             LocalSend.Item it = items.get(0);
             Intent i = new Intent(this, ShareActivity.class);

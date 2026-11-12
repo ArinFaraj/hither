@@ -816,7 +816,7 @@ struct Advert;
 #[cfg(not(target_os = "macos"))]
 impl Advert {
     fn new(mdns: &mdns_sd::ServiceDaemon, instance: &str, id: &[u8; 4], port: u16, info: &str) -> Result<Self> {
-        let hostname = format!("drop-{}.local.", String::from_utf8_lossy(id).to_lowercase());
+        let hostname = format!("hither-{}.local.", String::from_utf8_lossy(id).to_lowercase());
         let svc = mdns_sd::ServiceInfo::new(SERVICE, instance, &hostname, "", port, &[("n", info)][..])?.enable_addr_auto();
         mdns.register(svc)?;
         Ok(Advert)

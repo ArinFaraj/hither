@@ -51,7 +51,7 @@ enum AirDrop {
     }
 
     private static func temp(_ name: String, _ data: Data) -> URL? {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("drop-airdrop", isDirectory: true)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hither-airdrop", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(name)
         return (try? data.write(to: url)) == nil ? nil : url
@@ -63,7 +63,7 @@ enum Notifier {
         let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ k: String) -> String? { q.first { $0.name == k }?.value }
         let content = UNMutableNotificationContent()
-        content.title = value("title") ?? "drop"
+        content.title = value("title") ?? "Hither"
         content.body = value("body") ?? ""
         if let f = value("file") { content.userInfo = ["file": f] }
         if let f = value("image") ?? value("file"), let a = attachment(URL(fileURLWithPath: f)) {
@@ -74,7 +74,7 @@ enum Notifier {
 
     private static func attachment(_ src: URL) -> UNNotificationAttachment? {
         guard let type = UTType(filenameExtension: src.pathExtension), type.conforms(to: .image) else { return nil }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("drop-notify", isDirectory: true)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hither-notify", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let copy = dir.appendingPathComponent(UUID().uuidString).appendingPathExtension(src.pathExtension)
         guard (try? FileManager.default.copyItem(at: src, to: copy)) != nil else { return nil }
@@ -102,8 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private static func signed(_ u: URL) -> Bool {
-        let home = ProcessInfo.processInfo.environment["DROP_HOME"].map { URL(fileURLWithPath: $0) }
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/drop")
+        let home = ProcessInfo.processInfo.environment["HITHER_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/hither")
         guard let want = try? String(contentsOf: home.appendingPathComponent("menu-key"), encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), !want.isEmpty else { return false }
         let got = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "key" }?.value
@@ -111,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        let commands = urls.filter { $0.scheme == "dropmenu" && Self.signed($0) }
+        let commands = urls.filter { $0.scheme == "hither" && Self.signed($0) }
         for u in commands where u.host == "notify" { Notifier.post(u) }
         if commands.contains(where: { $0.host == "airdrop-clipboard" }) {
             Task { @MainActor in
@@ -139,8 +139,8 @@ struct Event: Identifiable {
 
 enum CLI {
     static let path: String = {
-        if let u = Bundle.main.url(forAuxiliaryExecutable: "drop") { return u.path }
-        return NSHomeDirectory() + "/bin/drop"
+        if let u = Bundle.main.url(forAuxiliaryExecutable: "hither") { return u.path }
+        return NSHomeDirectory() + "/bin/hither"
     }()
 
     static func run(_ args: [String], input: String? = nil) async -> [String: Any] {
@@ -161,7 +161,7 @@ enum CLI {
             let data = out.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
             return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                ?? ["ok": false, "error": "drop did not answer"]
+                ?? ["ok": false, "error": "hither did not answer"]
         }.value
     }
 }
@@ -177,6 +177,9 @@ final class Model: ObservableObject {
     @Published var ticket = ""
     @Published var pairMessage = ""
     @Published var loaded = false
+    @Published var update: String?
+    @Published var updating = false
+    @Published var updateError: String?
 
     func refresh() async {
         let s = await CLI.run(["status"])
@@ -185,6 +188,7 @@ final class Model: ObservableObject {
         name = s["name"] as? String ?? ""
         clip = s["clip"] as? Bool ?? false
         inbox = s["inbox"] as? String ?? ""
+        update = s["update"] as? String
         var list = (d["devices"] as? [[String: Any]] ?? []).map {
             let serial = $0["serial"] as? String
             let ls = $0["localsend"] as? String
@@ -208,6 +212,14 @@ final class Model: ObservableObject {
             )
         }
         loaded = true
+    }
+
+    func installUpdate() async {
+        updating = true
+        let r = await CLI.run(["update"])
+        updating = false
+        updateError = r["ok"] as? Bool == true ? nil : r["error"] as? String ?? "Update failed"
+        await refresh()
     }
 
     func flash(_ d: Device, _ text: String) {
@@ -278,7 +290,7 @@ struct Panel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(m.name.isEmpty ? "drop" : m.name).font(.headline)
+                Text(m.name.isEmpty ? "Hither" : m.name).font(.headline)
                 Spacer()
                 Toggle("Clipboard", isOn: Binding(get: { m.clip }, set: { v in Task { await m.setClip(v) } }))
                     .toggleStyle(.switch)
@@ -304,6 +316,21 @@ struct Panel: View {
 
     private var mainView: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if let v = m.update {
+                HStack {
+                    Text(m.updating ? "Updating to \(v)..." : m.updateError ?? "Hither \(v) is out")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Update") { Task { await m.installUpdate() } }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .disabled(m.updating)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                Divider()
+            }
             if m.devices.isEmpty {
                 Text(m.loaded ? "No devices yet. Pair one, or plug in a phone with USB debugging on." : "Starting...")
                     .font(.callout)
@@ -343,7 +370,7 @@ struct Panel: View {
                 Spacer()
                 Button("Copy") {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString("drop pair \(m.ticket)", forType: .string)
+                    NSPasteboard.general.setString("hither pair \(m.ticket)", forType: .string)
                 }
                 .disabled(m.ticket.isEmpty)
             }
@@ -355,7 +382,7 @@ struct Panel: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.caption, design: .monospaced))
                 Button("Join") {
-                    let t = joinText.replacingOccurrences(of: "drop pair", with: "")
+                    let t = joinText.replacingOccurrences(of: "hither pair", with: "")
                     Task { if await m.join(t) { joinText = "" } }
                 }
                 .disabled(joinText.isEmpty)
@@ -546,7 +573,7 @@ struct RecentRow: View {
 }
 
 @main
-struct DropApp: App {
+struct HitherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var m = Model()
 

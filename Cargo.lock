@@ -632,40 +632,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "drop"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "bytes",
- "cbc",
- "data-encoding",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "iroh",
- "iroh-mdns-address-lookup",
- "libc",
- "mdns-sd",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "prost",
- "rand 0.9.5",
- "rcgen",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "socket2",
- "tokio",
- "tokio-rustls",
- "tokio-util",
-]
-
-[[package]]
 name = "ed25519"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1043,6 +1009,40 @@ dependencies = [
  "tinyvec",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "hither"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "bytes",
+ "cbc",
+ "data-encoding",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh",
+ "iroh-mdns-address-lookup",
+ "libc",
+ "mdns-sd",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "prost",
+ "rand 0.9.5",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
 ]
 
 [[package]]

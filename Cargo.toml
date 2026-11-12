@@ -1,5 +1,5 @@
 [package]
-name = "drop"
+name = "hither"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["clipboard", "file-transfer", "localsend", "quick-share", "iroh"]
 categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
-name = "drop"
+name = "hither"
 path = "src/main.rs"
 
 [dependencies]

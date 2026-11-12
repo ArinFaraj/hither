@@ -7,6 +7,7 @@ mod quickshare;
 mod phone;
 mod proto;
 mod store;
+mod update;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -14,33 +15,35 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "drop: send files, share the clipboard and type on your devices
+const USAGE: &str = "hither: send files, share the clipboard and type on your devices
 
 usage:
-  drop devices                     list devices and how each one is reached
-  drop send <device> <file>...     send files (USB, LAN, Tailscale or internet, picked for you)
-  drop get <device> <path> [dest]  copy a file off a phone
-  drop clip [get <device>]         print the clipboard (here, or on a phone)
-  drop clip set <text|->           set the clipboard here (it syncs to your devices)
-  drop clip send <device> <text|-> put text on one device's clipboard
-  drop clip on|off [device]        turn clipboard sync on or off
-  drop clip image <file> [device]  put an image on the clipboard (here, or on one device)
-  drop clip save <file>            save the image on the clipboard here as a PNG
-  drop screenshots [on|off]        put new screenshots on the clipboard so they sync
-  drop android install [device]    install the drop app on a phone over adb
-  drop type <device> <text|->      type text on a phone
-  drop key <device> <key>...       press keys (enter, back, home, tab, del, up, ...)
-  drop pair                        show a ticket for another device to join
-  drop pair <ticket>               join the device that showed the ticket
-  drop rename <device|.> <name>    rename a device (. is this one)
-  drop forget <device>             remove a device
-  drop autostart on|off            keep drop running in the background
-  drop localsend [ask|always|off]  let LocalSend apps nearby see this device and send to it
-  drop quickshare [ask|always|off] let Android phones nearby send here with Quick Share
-  drop airdrop <file>...           send files with AirDrop (macOS, opens the AirDrop picker)
-  drop airdrop                     send the clipboard (text, a link or an image) with AirDrop
-  drop status | recent | stop
-  drop daemon                      run the background service
+  hither devices                     list devices and how each one is reached
+  hither send <device> <file>...     send files (USB, LAN, Tailscale or internet, picked for you)
+  hither get <device> <path> [dest]  copy a file off a phone
+  hither clip [get <device>]         print the clipboard (here, or on a phone)
+  hither clip set <text|->           set the clipboard here (it syncs to your devices)
+  hither clip send <device> <text|-> put text on one device's clipboard
+  hither clip on|off [device]        turn clipboard sync on or off
+  hither clip image <file> [device]  put an image on the clipboard (here, or on one device)
+  hither clip save <file>            save the image on the clipboard here as a PNG
+  hither screenshots [on|off]        put new screenshots on the clipboard so they sync
+  hither android install [device]    install the hither app on a phone over adb
+  hither type <device> <text|->      type text on a phone
+  hither key <device> <key>...       press keys (enter, back, home, tab, del, up, ...)
+  hither pair                        show a ticket for another device to join
+  hither pair <ticket>               join the device that showed the ticket
+  hither rename <device|.> <name>    rename a device (. is this one)
+  hither forget <device>             remove a device
+  hither autostart on|off            keep hither running in the background
+  hither localsend [ask|always|off]  let LocalSend apps nearby see this device and send to it
+  hither quickshare [ask|always|off] let Android phones nearby send here with Quick Share
+  hither airdrop <file>...           send files with AirDrop (macOS, opens the AirDrop picker)
+  hither airdrop                     send the clipboard (text, a link or an image) with AirDrop
+  hither update [--check]            install the newest release from GitHub
+  hither updates [auto|notify|off]   what to do when a new release is out (default notify)
+  hither status | recent | stop | version
+  hither daemon                      run the background service
 
 add --json to any command for machine output.";
 
@@ -50,7 +53,7 @@ fn main() {
     if args.first().map(String::as_str) == Some("daemon") {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         if let Err(e) = rt.block_on(daemon::run()) {
-            eprintln!("drop: {e:#}");
+            eprintln!("hither: {e:#}");
             std::process::exit(1);
         }
         return;
@@ -64,7 +67,31 @@ fn main() {
         match autostart::set(*v == "on") {
             Ok(msg) => println!("{msg}"),
             Err(e) => {
-                eprintln!("drop: {e:#}");
+                eprintln!("hither: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if matches!(args.first().map(String::as_str), Some("version" | "--version" | "-V")) {
+        println!("hither {}", update::VERSION);
+        return;
+    }
+    if args.first().map(String::as_str) == Some("update") {
+        let check_only = take_flag(&mut args, "--check");
+        let force = take_flag(&mut args, "--force");
+        if args.len() > 1 {
+            eprintln!("hither: unknown command: {}\n\n{USAGE}", args.join(" "));
+            std::process::exit(2);
+        }
+        match self_update(check_only, force, json_out) {
+            Ok(()) => {}
+            Err(e) => {
+                if json_out {
+                    println!("{}", json!({"ok": false, "error": format!("{e:#}")}));
+                } else {
+                    eprintln!("hither: {e:#}");
+                }
                 std::process::exit(1);
             }
         }
@@ -74,7 +101,7 @@ fn main() {
     if clip_airdrop || args.first().map(String::as_str) == Some("airdrop") {
         let files = if clip_airdrop { &[][..] } else { &args[1..] };
         if let Err(e) = airdrop(files) {
-            eprintln!("drop: {e:#}");
+            eprintln!("hither: {e:#}");
             std::process::exit(1);
         }
         return;
@@ -88,7 +115,7 @@ fn main() {
                 } else if ok {
                     print_human(&req, &reply);
                 } else {
-                    eprintln!("drop: {}", reply["error"].as_str().unwrap_or("failed"));
+                    eprintln!("hither: {}", reply["error"].as_str().unwrap_or("failed"));
                 }
                 std::process::exit(if ok { 0 } else { 1 });
             }
@@ -96,17 +123,64 @@ fn main() {
                 if json_out {
                     println!("{}", json!({"ok": false, "error": format!("{e:#}")}));
                 } else {
-                    eprintln!("drop: {e:#}");
+                    eprintln!("hither: {e:#}");
                 }
                 std::process::exit(3);
             }
         },
         Ok(None) => println!("{USAGE}"),
         Err(e) => {
-            eprintln!("drop: {e:#}\n\n{USAGE}");
+            eprintln!("hither: {e:#}\n\n{USAGE}");
             std::process::exit(2);
         }
     }
+}
+
+fn say(line: &str) {
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+fn self_update(check_only: bool, force: bool, json_out: bool) -> Result<()> {
+    let Some(r) = update::check()? else {
+        if json_out {
+            say(&json!({"ok": true, "version": update::VERSION, "update": null}).to_string());
+        } else {
+            say(&format!("hither {} is the newest release", update::VERSION));
+        }
+        return Ok(());
+    };
+    if check_only {
+        if json_out {
+            say(&json!({"ok": true, "version": update::VERSION, "update": r.version(), "url": r.url()}).to_string());
+        } else {
+            say(&format!("hither {} is out (you have {}). Run `hither update` to install it.\n{}", r.version(), update::VERSION, r.url()));
+        }
+        return Ok(());
+    }
+    if !json_out {
+        say(&format!("downloading hither {}", r.version()));
+    }
+    let path = update::install(&r, force)?;
+    let was_running = UnixStream::connect(store::sock_path()).is_ok();
+    if was_running {
+        let _ = call(&json!({"cmd": "restart"}));
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(15) && UnixStream::connect(store::sock_path()).is_err() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if UnixStream::connect(store::sock_path()).is_err() {
+            connect()?;
+        }
+    }
+    if json_out {
+        say(&json!({"ok": true, "version": r.version(), "path": path}).to_string());
+    } else {
+        say(&format!("updated to hither {} ({path})", r.version()));
+    }
+    update::restart_menu();
+    Ok(())
 }
 
 fn airdrop(files: &[String]) -> Result<()> {
@@ -114,10 +188,10 @@ fn airdrop(files: &[String]) -> Result<()> {
         bail!("AirDrop is only on macOS");
     }
     if files.is_empty() {
-        let url = format!("dropmenu://airdrop-clipboard?key={}", store::menu_key()?);
-        let ok = std::process::Command::new("open").args(["-b", "local.drop.menu", &url]).status()?.success();
+        let url = format!("hither://airdrop-clipboard?key={}", store::menu_key()?);
+        let ok = std::process::Command::new("open").args(["-b", "io.github.arinfaraj.hither", &url]).status()?.success();
         if !ok {
-            bail!("could not reach Drop.app (install it with scripts/build-mac-app.sh)");
+            bail!("could not reach Hither.app (install it with scripts/build-mac-app.sh)");
         }
         return Ok(());
     }
@@ -125,9 +199,9 @@ fn airdrop(files: &[String]) -> Result<()> {
         .iter()
         .map(|f| std::fs::canonicalize(f).with_context(|| format!("{f}: no such file")))
         .collect::<Result<Vec<_>>>()?;
-    let ok = std::process::Command::new("open").args(["-b", "local.drop.menu"]).args(&paths).status()?.success();
+    let ok = std::process::Command::new("open").args(["-b", "io.github.arinfaraj.hither"]).args(&paths).status()?.success();
     if !ok {
-        bail!("could not reach Drop.app (install it with scripts/build-mac-app.sh)");
+        bail!("could not reach Hither.app (install it with scripts/build-mac-app.sh)");
     }
     Ok(())
 }
@@ -194,6 +268,8 @@ fn run(args: &[String]) -> Result<Option<Value>> {
         ["forget", dev] => json!({"cmd": "forget", "device": dev}),
         ["localsend"] => json!({"cmd": "localsend"}),
         ["localsend", m @ ("ask" | "always" | "off")] => json!({"cmd": "localsend", "mode": m}),
+        ["updates"] => json!({"cmd": "updates"}),
+        ["updates", m @ ("auto" | "notify" | "off")] => json!({"cmd": "updates", "mode": m}),
         ["quickshare"] => json!({"cmd": "quickshare"}),
         ["quickshare", m @ ("ask" | "always" | "off")] => json!({"cmd": "quickshare", "mode": m}),
         _ => bail!("unknown command: {}", args.join(" ")),
@@ -225,7 +301,7 @@ fn connect() -> Result<UnixStream> {
             });
         }
     }
-    cmd.spawn().context("starting the drop service")?;
+    cmd.spawn().context("starting the hither service")?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(8) {
         std::thread::sleep(Duration::from_millis(100));
@@ -233,10 +309,13 @@ fn connect() -> Result<UnixStream> {
             return Ok(s);
         }
     }
-    bail!("the drop service did not start; see {}", store::data_dir().join("daemon.log").display())
+    bail!("the hither service did not start; see {}", store::data_dir().join("daemon.log").display())
 }
 
 fn call(req: &Value) -> Result<Value> {
+    if req["cmd"] == "stop" && UnixStream::connect(store::sock_path()).is_err() {
+        return Ok(json!({"ok": true}));
+    }
     let mut s = connect()?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
@@ -269,11 +348,15 @@ fn print_human(req: &Value, r: &Value) {
             println!("inbox: {}", s(&r["inbox"]));
             println!("adb: {}", r["adb"].as_str().unwrap_or("not found"));
             println!("devices: {}", r["devices"]);
+            println!("version: {}", s(&r["version"]));
+            if let Some(v) = r["update"].as_str() {
+                println!("update: {v} is out, run `hither update`");
+            }
         }
         "devices" => {
             let list = r["devices"].as_array().cloned().unwrap_or_default();
             if list.is_empty() {
-                println!("no devices yet. run `drop pair` here and `drop pair <ticket>` on the other one, or plug in a phone with adb on.");
+                println!("no devices yet. run `hither pair` here and `hither pair <ticket>` on the other one, or plug in a phone with adb on.");
             }
             for d in list {
                 let via: Vec<String> = d["via"].as_array().into_iter().flatten().map(&s).collect();
@@ -304,7 +387,7 @@ fn print_human(req: &Value, r: &Value) {
         "get" => println!("{}", s(&r["saved"])),
         "clip_get" => {
             if let Some(n) = r["image"].as_f64() {
-                println!("(an image, {}; save it with `drop clip save <file>`)", human_bytes(n));
+                println!("(an image, {}; save it with `hither clip save <file>`)", human_bytes(n));
             } else if let Some(t) = r["text"].as_str() {
                 print!("{t}");
                 if !t.ends_with('\n') {
@@ -313,15 +396,27 @@ fn print_human(req: &Value, r: &Value) {
             }
         }
         "clip_save" => println!("{}", s(&r["saved"])),
-        "android_install" => println!("installed the drop app on {}", s(&r["device"])),
+        "android_install" => println!("installed the hither app on {}", s(&r["device"])),
         "screenshots" => match (r["screenshots"] == true, r["dir"].as_str()) {
             (true, Some(d)) => println!("screenshots: on, new ones in {d} go to the clipboard"),
             (true, None) => println!("screenshots: on"),
             (false, _) => println!("screenshots: off"),
         },
+        "updates" => {
+            let mode = s(&r["updates"]);
+            let what = match mode.as_str() {
+                "auto" => "installed by themselves",
+                "off" => "not checked",
+                _ => "announced, install them with `hither update`",
+            };
+            println!("updates: {mode} (new releases are {what})");
+            if let Some(v) = r["update"].as_str() {
+                println!("hither {v} is out, you have {}", s(&r["version"]));
+            }
+        }
         "clip_sync" => println!("clipboard sync {}", if r["clip"] == true { "on" } else { "off" }),
         "pair_start" => {
-            println!("on the other device run:\n\n  drop pair {}\n", s(&r["ticket"]));
+            println!("on the other device run:\n\n  hither pair {}\n", s(&r["ticket"]));
             println!("the ticket works once, for {} minutes.", r["minutes"]);
         }
         "pair_join" => println!("paired with {}", s(&r["device"])),

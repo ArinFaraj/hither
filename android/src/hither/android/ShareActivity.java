@@ -1,4 +1,4 @@
-package drop.android;
+package hither.android;
 
 import android.app.Activity;
 import android.content.Intent;
@@ -17,9 +17,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class ShareActivity extends Activity {
-    static final String EXTRA_CLIP_FILE = "drop.clip_file";
-    static final String EXTRA_CLIP_TEXT = "drop.clip_text";
-    static final String EXTRA_PICK = "drop.pick";
+    static final String EXTRA_CLIP_FILE = "hither.clip_file";
+    static final String EXTRA_CLIP_TEXT = "hither.clip_text";
+    static final String EXTRA_PICK = "hither.pick";
 
     private final List<Peer> peers = new ArrayList<>();
     private ArrayAdapter<Peer> adapter;
@@ -62,7 +62,7 @@ public final class ShareActivity extends Activity {
         root.addView(list, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (int) (280 * getResources().getDisplayMetrics().density)));
         setContentView(root);
         setFinishOnTouchOutside(true);
-        Peer saved = Drop.target(this);
+        Peer saved = Hither.target(this);
         if (saved != null) add(saved);
         new Thread(() -> {
             try {
@@ -115,7 +115,7 @@ public final class ShareActivity extends Activity {
 
     private void pick(Peer p) {
         searching = false;
-        Drop.setTarget(this, p);
+        Hither.setTarget(this, p);
         if (pickOnly) {
             finish();
             return;

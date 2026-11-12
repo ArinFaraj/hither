@@ -12,13 +12,13 @@ fn quiet(cmd: &mut Command) -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn set(on: bool) -> Result<String> {
-    let plist = crate::store::home().join("Library/LaunchAgents/drop.plist");
+    let plist = crate::store::home().join("Library/LaunchAgents/hither.plist");
     let uid = String::from_utf8(Command::new("id").arg("-u").output()?.stdout)?.trim().to_string();
     let domain = format!("gui/{uid}");
-    quiet(Command::new("launchctl").args(["bootout", &format!("{domain}/drop")]));
+    quiet(Command::new("launchctl").args(["bootout", &format!("{domain}/hither")]));
     if !on {
         let _ = std::fs::remove_file(&plist);
-        return Ok("drop will no longer start at login".into());
+        return Ok("hither will no longer start at login".into());
     }
     let log = crate::store::data_dir().join("daemon.log");
     let xml = format!(
@@ -26,7 +26,7 @@ pub fn set(on: bool) -> Result<String> {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>drop</string>
+  <key>Label</key><string>hither</string>
   <key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -44,35 +44,35 @@ pub fn set(on: bool) -> Result<String> {
     if !quiet(Command::new("launchctl").args(["bootstrap", &domain, &plist.to_string_lossy()])) {
         bail!("launchctl could not load {}", plist.display());
     }
-    Ok("drop starts at login and restarts if it crashes (LaunchAgent)".into())
+    Ok("hither starts at login and restarts if it crashes (LaunchAgent)".into())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn set(on: bool) -> Result<String> {
     if quiet(Command::new("systemctl").args(["--user", "show-environment"])) {
-        let unit = crate::store::home().join(".config/systemd/user/drop.service");
+        let unit = crate::store::home().join(".config/systemd/user/hither.service");
         if !on {
-            quiet(Command::new("systemctl").args(["--user", "disable", "--now", "drop.service"]));
+            quiet(Command::new("systemctl").args(["--user", "disable", "--now", "hither.service"]));
             let _ = std::fs::remove_file(&unit);
-            return Ok("drop will no longer start on its own".into());
+            return Ok("hither will no longer start on its own".into());
         }
         std::fs::create_dir_all(unit.parent().unwrap())?;
         std::fs::write(
             &unit,
             format!(
-                "[Unit]\nDescription=drop\n\n[Service]\nExecStart={} daemon\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=hither\n\n[Service]\nExecStart={} daemon\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
                 exe()?.display()
             ),
         )?;
         quiet(Command::new("systemctl").args(["--user", "daemon-reload"]));
-        if !quiet(Command::new("systemctl").args(["--user", "enable", "--now", "drop.service"])) {
-            bail!("systemctl --user enable drop.service failed");
+        if !quiet(Command::new("systemctl").args(["--user", "enable", "--now", "hither.service"])) {
+            bail!("systemctl --user enable hither.service failed");
         }
-        return Ok("drop runs as a systemd user service".into());
+        return Ok("hither runs as a systemd user service".into());
     }
     use anyhow::Context;
     if on && !quiet(Command::new("pgrep").args(["-x", "cron|crond"])) {
-        bail!("no systemd user session and no cron daemon here; start `drop daemon` from whatever supervises this machine");
+        bail!("no systemd user session and no cron daemon here; start `hither daemon` from whatever supervises this machine");
     }
     let line = format!("*/2 * * * * {} status >/dev/null 2>&1", exe()?.display());
     let current = Command::new("crontab").arg("-l").stderr(Stdio::null()).output().context("crontab not found")?;
@@ -95,9 +95,9 @@ pub fn set(on: bool) -> Result<String> {
         bail!("crontab refused the update");
     }
     Ok(if on {
-        "no systemd user session here, so cron checks every 2 minutes and starts drop if it is down".into()
+        "no systemd user session here, so cron checks every 2 minutes and starts hither if it is down".into()
     } else {
-        "drop will no longer start on its own".into()
+        "hither will no longer start on its own".into()
     })
 }
 

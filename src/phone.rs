@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
-const JAR: &[u8] = include_bytes!("../assets/drop-helper.jar");
+const JAR: &[u8] = include_bytes!("../assets/hither-helper.jar");
 
 pub struct Session {
     pub serial: String,
@@ -27,14 +27,14 @@ pub struct ClipEvent {
     pub clip: Clip,
 }
 
-pub const CLIP_URI: &str = "content://drop.android.clip/in";
+pub const CLIP_URI: &str = "content://hither.android.clip/in";
 
 fn remote_jar() -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     JAR.hash(&mut hasher);
     let h = hasher.finish();
-    format!("/data/local/tmp/drop-helper-{:08x}.jar", h as u32)
+    format!("/data/local/tmp/hither-helper-{:08x}.jar", h as u32)
 }
 
 impl Session {
@@ -56,7 +56,7 @@ impl Session {
         let jar = remote_jar();
         let check = adb::shell(transport, &format!("[ -f {jar} ] && echo ok")).await.unwrap_or_default();
         if check.trim() != "ok" {
-            let tmp = crate::store::data_dir().join("drop-helper.jar");
+            let tmp = crate::store::data_dir().join("hither-helper.jar");
             tokio::fs::write(&tmp, JAR).await?;
             let out = Command::new(adb::adb_path().context("adb not found")?)
                 .args(["-s", transport, "push", &tmp.to_string_lossy(), &jar])
@@ -67,12 +67,12 @@ impl Session {
             }
             let _ = adb::shell(
                 transport,
-                &format!("for f in /data/local/tmp/drop-helper-*.jar; do [ \"$f\" = {jar} ] || rm -f \"$f\"; done"),
+                &format!("for f in /data/local/tmp/hither-helper-*.jar; do [ \"$f\" = {jar} ] || rm -f \"$f\"; done"),
             )
             .await;
         }
         let mut child = Command::new(adb::adb_path().context("adb not found")?)
-            .args(["-s", transport, "shell", &format!("CLASSPATH={jar} exec app_process / drop.Helper")])
+            .args(["-s", transport, "shell", &format!("CLASSPATH={jar} exec app_process / hither.Helper")])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
