@@ -365,7 +365,7 @@ fn mime(path: &Path) -> &'static str {
     }
 }
 
-fn human(n: u64) -> String {
+pub(crate) fn human(n: u64) -> String {
     let mut v = n as f64;
     let mut u = 0;
     let units = ["B", "KB", "MB", "GB", "TB"];

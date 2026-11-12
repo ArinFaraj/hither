@@ -3,6 +3,7 @@ mod autostart;
 mod clip;
 mod daemon;
 mod localsend;
+mod quickshare;
 mod phone;
 mod proto;
 mod store;
@@ -31,6 +32,7 @@ usage:
   drop forget <device>             remove a device
   drop autostart on|off            keep drop running in the background
   drop localsend [ask|always|off]  let LocalSend apps nearby see this device and send to it
+  drop quickshare [ask|always|off] let Android phones nearby send here with Quick Share
   drop airdrop <file>...           send files with AirDrop (macOS, opens the AirDrop picker)
   drop status | recent | stop
   drop daemon                      run the background service
@@ -173,6 +175,8 @@ fn run(args: &[String]) -> Result<Option<Value>> {
         ["forget", dev] => json!({"cmd": "forget", "device": dev}),
         ["localsend"] => json!({"cmd": "localsend"}),
         ["localsend", m @ ("ask" | "always" | "off")] => json!({"cmd": "localsend", "mode": m}),
+        ["quickshare"] => json!({"cmd": "quickshare"}),
+        ["quickshare", m @ ("ask" | "always" | "off")] => json!({"cmd": "quickshare", "mode": m}),
         _ => bail!("unknown command: {}", args.join(" ")),
     };
     Ok(Some(req))
@@ -250,7 +254,7 @@ fn print_human(req: &Value, r: &Value) {
             for d in list {
                 let via: Vec<String> = d["via"].as_array().into_iter().flatten().map(&s).collect();
                 let via = if via.is_empty() { "offline".to_string() } else { via.join(", ") };
-                let clip = if d["clip"] == true || d["localsend"].is_string() { "" } else { "  (clipboard off)" };
+                let clip = if d["clip"] == true || d["localsend"].is_string() || d["quickshare"].is_string() { "" } else { "  (clipboard off)" };
                 println!("{:<24} {}{}", s(&d["name"]), via, clip);
             }
         }
@@ -299,6 +303,14 @@ fn print_human(req: &Value, r: &Value) {
             }
             for p in r["peers"].as_array().into_iter().flatten() {
                 println!("  {:<24} {}", s(&p["alias"]), s(&p["ip"]));
+            }
+        }
+        "quickshare" => {
+            let mode = s(&r["mode"]);
+            match (mode.as_str(), r["running"] == true) {
+                ("off", _) => println!("quickshare: off"),
+                (_, true) => println!("quickshare: {mode}, Android phones nearby can send here (port {})", r["port"]),
+                (_, false) => println!("quickshare: {mode}, not running ({})", s(&r["error"])),
             }
         }
         _ => {}

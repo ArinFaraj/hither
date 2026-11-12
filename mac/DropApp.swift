@@ -9,11 +9,11 @@ struct Device: Identifiable, Hashable {
     let via: [String]
     let clip: Bool
     let phone: Bool
-    let localsend: Bool
+    let foreign: Bool
 
     var airdrop: Bool { id == AirDrop.id }
 
-    static let airdropRow = Device(id: AirDrop.id, name: "AirDrop", via: ["airdrop"], clip: true, phone: false, localsend: false)
+    static let airdropRow = Device(id: AirDrop.id, name: "AirDrop", via: ["airdrop"], clip: true, phone: false, foreign: false)
 }
 
 enum AirDrop {
@@ -101,7 +101,7 @@ final class Model: ObservableObject {
                 via: $0["via"] as? [String] ?? [],
                 clip: $0["clip"] as? Bool ?? true,
                 phone: serial != nil || $0["type"] as? String == "mobile",
-                localsend: ls != nil
+                foreign: ls != nil || $0["quickshare"] is String
             )
         }
         if AirDrop.available { list.append(.airdropRow) }
@@ -321,6 +321,7 @@ struct DeviceRow: View {
             if v.hasPrefix("direct") { return "Internet" }
             if v.hasPrefix("relay") { return "Internet (relay)" }
             if v.hasPrefix("localsend") { return "LocalSend" }
+            if v.hasPrefix("quickshare") { return "Quick Share" }
             if v == "airdrop" { return "Nearby Apple devices" }
             return v
         }.joined(separator: ", ")
@@ -339,7 +340,7 @@ struct DeviceRow: View {
                     .lineLimit(1)
             }
             Spacer()
-            if !d.clip && !d.localsend && !d.airdrop {
+            if !d.clip && !d.foreign && !d.airdrop {
                 Image(systemName: "doc.on.clipboard")
                     .foregroundStyle(.tertiary)
                     .help("Clipboard sync is off for this device")
@@ -363,7 +364,7 @@ struct DeviceRow: View {
         .contextMenu {
             Button("Send files...") { pick() }
             Button("Send clipboard") { Task { await m.sendClipboard(d) } }
-            if !d.localsend && !d.airdrop {
+            if !d.foreign && !d.airdrop {
                 Toggle("Sync clipboard", isOn: Binding(get: { d.clip }, set: { v in Task { await m.setClip(v, for: d) } }))
                 Divider()
                 Button("Forget") { Task { await m.forget(d) } }

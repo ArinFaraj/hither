@@ -55,6 +55,8 @@ pub struct Config {
     pub devices: Vec<Device>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localsend: Option<crate::localsend::Mode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quickshare: Option<crate::localsend::Mode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub localsend_trusted: Vec<String>,
 }
@@ -71,6 +73,7 @@ impl Config {
             inbox: default_inbox(),
             devices: Vec::new(),
             localsend: None,
+            quickshare: None,
             localsend_trusted: Vec::new(),
         };
         cfg.save()?;

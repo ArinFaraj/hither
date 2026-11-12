@@ -2,6 +2,7 @@ use crate::proto::{self, ALPN, Msg};
 use crate::store::{self, Config, Device};
 use crate::phone::{self, ClipEvent, Session};
 use crate::localsend::{self, LocalSend, Mode};
+use crate::quickshare::{self, QuickShare};
 use crate::{adb, clip};
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, QuicTransportConfig, VarInt, presets};
@@ -36,6 +37,7 @@ pub enum Req {
     Rename { device: String, name: String },
     Forget { device: String },
     Localsend { mode: Option<Mode> },
+    Quickshare { mode: Option<Mode> },
     Stop,
 }
 
@@ -51,6 +53,8 @@ pub struct State {
     clip_events: tokio::sync::mpsc::UnboundedSender<ClipEvent>,
     ls: Mutex<Option<Arc<LocalSend>>>,
     ls_error: Mutex<Option<String>>,
+    qs: Mutex<Option<Arc<QuickShare>>>,
+    qs_error: Mutex<Option<String>>,
     me: std::sync::Weak<State>,
 }
 
@@ -103,6 +107,30 @@ impl localsend::Host for LsHost {
             let inbox = s.cfg.lock().unwrap().inbox.clone();
             let _ = std::fs::write(store::unique_path(&inbox, &format!("{from}.txt")), text);
         }
+    }
+}
+
+struct QsHost(LsHost);
+
+impl quickshare::Host for QsHost {
+    fn alias(&self) -> String {
+        localsend::Host::alias(&self.0)
+    }
+
+    fn inbox(&self) -> PathBuf {
+        localsend::Host::inbox(&self.0)
+    }
+
+    fn mode(&self) -> Mode {
+        self.0.0.upgrade().map(|s| s.qs_mode()).unwrap_or(Mode::Off)
+    }
+
+    fn received(&self, from: &str, path: &Path) {
+        localsend::Host::received(&self.0, from, path)
+    }
+
+    fn text(&self, from: &str, text: &str) {
+        localsend::Host::text(&self.0, from, text)
     }
 }
 
@@ -239,6 +267,8 @@ pub async fn run() -> Result<()> {
         clip_events: clip_tx,
         ls: Mutex::new(None),
         ls_error: Mutex::new(None),
+        qs: Mutex::new(None),
+        qs_error: Mutex::new(None),
         me: me.clone(),
     });
     {
@@ -278,6 +308,7 @@ pub async fn run() -> Result<()> {
     #[cfg(target_os = "macos")]
     tokio::spawn(watch_airdrop(st.clone()));
     st.start_localsend().await;
+    st.start_quickshare().await;
 
     let listener = tokio::net::UnixListener::bind(&sock)?;
     #[cfg(unix)]
@@ -498,6 +529,27 @@ impl State {
         }
     }
 
+    fn qs_mode(&self) -> Mode {
+        self.cfg.lock().unwrap().quickshare.unwrap_or_else(Mode::platform_default)
+    }
+
+    async fn start_quickshare(&self) {
+        if self.qs_mode() == Mode::Off || self.qs.lock().unwrap().is_some() {
+            return;
+        }
+        match QuickShare::start(Arc::new(QsHost(LsHost(self.me.clone())))).await {
+            Ok(qs) => {
+                eprintln!("quickshare on port {}", qs.port);
+                *self.qs_error.lock().unwrap() = None;
+                *self.qs.lock().unwrap() = Some(qs);
+            }
+            Err(e) => {
+                eprintln!("quickshare: {e:#}");
+                *self.qs_error.lock().unwrap() = Some(format!("{e:#}"));
+            }
+        }
+    }
+
     fn ls_peer(&self, q: &str) -> Option<(Arc<LocalSend>, localsend::Peer)> {
         let ls = self.ls()?;
         let peer = ls.find(q)?;
@@ -520,6 +572,33 @@ impl State {
             results.push(json!({"file": p, "bytes": bytes, "secs": secs / sent.len() as f64, "via": format!("localsend {}", peer.ip), "dest": ""}));
         }
         Ok(json!({"device": peer.alias, "sent": results}))
+    }
+
+    fn qs_peer(&self, q: &str) -> Option<(Arc<QuickShare>, quickshare::Peer)> {
+        if self.qs_mode() == Mode::Off {
+            return None;
+        }
+        let qs = self.qs.lock().unwrap().clone()?;
+        let peer = qs.find(q)?;
+        Some((qs, peer))
+    }
+
+    async fn send_quickshare(&self, qs: &QuickShare, peer: &quickshare::Peer, paths: &[PathBuf]) -> Result<Value> {
+        for p in paths {
+            if !p.is_file() {
+                bail!("{} is not a file", p.display());
+            }
+        }
+        let started = Instant::now();
+        qs.send_files(peer, paths).await?;
+        let secs = started.elapsed().as_secs_f64();
+        let mut results = Vec::new();
+        for p in paths {
+            let bytes = tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0);
+            self.log("file_out", &peer.name, p.display().to_string());
+            results.push(json!({"file": p, "bytes": bytes, "secs": secs / paths.len() as f64, "via": format!("quickshare {}", peer.addr.ip()), "dest": ""}));
+        }
+        Ok(json!({"device": peer.name, "sent": results}))
     }
 
     fn session(&self, serial: &str) -> Option<Arc<Session>> {
@@ -770,16 +849,30 @@ impl State {
                         }));
                     }
                 }
+                if let Some(qs) = self.qs.lock().unwrap().clone().filter(|_| self.qs_mode() != Mode::Off) {
+                    for p in qs.peers() {
+                        let kind = match p.device_type { 1 | 5 => "mobile", 2 => "tablet", _ => "desktop" };
+                        list.push(json!({
+                            "name": p.name, "id": null, "serial": null, "clip": false, "helper": false,
+                            "via": [format!("quickshare {}", p.addr.ip())], "quickshare": p.addr.to_string(), "type": kind,
+                        }));
+                    }
+                }
                 Ok(json!({"devices": list}))
             }
             Req::Recent => Ok(json!({"recent": self.recent.lock().unwrap().iter().cloned().collect::<Vec<_>>()})),
             Req::Send { to, paths } => {
                 let (dev, phone) = match self.resolve(&to).await {
                     Ok(r) => r,
-                    Err(e) => match self.ls_peer(&to) {
-                        Some((ls, peer)) => return self.send_localsend(&ls, &peer, &paths).await,
-                        None => return Err(e),
-                    },
+                    Err(e) => {
+                        if let Some((ls, peer)) = self.ls_peer(&to) {
+                            return self.send_localsend(&ls, &peer, &paths).await;
+                        }
+                        if let Some((qs, peer)) = self.qs_peer(&to) {
+                            return self.send_quickshare(&qs, &peer, &paths).await;
+                        }
+                        return Err(e);
+                    }
                 };
                 let mut results = Vec::new();
                 for path in paths {
@@ -826,13 +919,17 @@ impl State {
             Req::ClipSet { text, to: Some(to) } => {
                 let dev = match self.resolve(&to).await {
                     Ok((d, _)) => d,
-                    Err(e) => match self.ls_peer(&to) {
-                        Some((ls, peer)) => {
+                    Err(e) => {
+                        if let Some((ls, peer)) = self.ls_peer(&to) {
                             ls.send_text(&peer, &text).await?;
                             return Ok(json!({"device": peer.alias}));
                         }
-                        None => return Err(e),
-                    },
+                        if let Some((qs, peer)) = self.qs_peer(&to) {
+                            qs.send_text(&peer, &text).await?;
+                            return Ok(json!({"device": peer.name}));
+                        }
+                        return Err(e);
+                    }
                 };
                 if let Some(sess) = dev.serial.as_deref().and_then(|s| self.session(s)) {
                     sess.set_clip(&text).await?;
@@ -958,6 +1055,27 @@ impl State {
                     "port": localsend::PORT,
                     "fingerprint": ls.as_ref().map(|l| l.fingerprint().to_string()),
                     "peers": ls.map(|l| l.peers()).unwrap_or_default(),
+                }))
+            }
+            Req::Quickshare { mode } => {
+                if let Some(m) = mode {
+                    self.update_cfg(|c| {
+                        c.quickshare = Some(m);
+                        Ok(())
+                    })?;
+                    if m == Mode::Off {
+                        self.qs.lock().unwrap().take();
+                    } else {
+                        self.start_quickshare().await;
+                    }
+                }
+                let qs = self.qs.lock().unwrap().clone();
+                Ok(json!({
+                    "mode": self.qs_mode(),
+                    "running": qs.is_some(),
+                    "error": if self.qs_mode() == Mode::Off { None } else { self.qs_error.lock().unwrap().clone() },
+                    "port": qs.as_ref().map(|q| q.port),
+                    "name": qs.map(|q| q.name.clone()),
                 }))
             }
             Req::Stop => Ok(json!({})),
