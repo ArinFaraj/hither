@@ -574,6 +574,32 @@ struct RecentRow: View {
 
 @main
 struct HitherApp: App {
+    static let mark: NSImage = {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            let u: CGFloat = 18 / 50
+            func p(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: (x - 29) * u, y: (y - 29) * u) }
+            let arrows = NSBezierPath()
+            for c in [[(44, 32), (54, 42), (64, 32)], [(44, 76), (54, 66), (64, 76)],
+                      [(32, 44), (42, 54), (32, 64)], [(76, 44), (66, 54), (76, 64)]] {
+                arrows.move(to: p(CGFloat(c[0].0), CGFloat(c[0].1)))
+                arrows.line(to: p(CGFloat(c[1].0), CGFloat(c[1].1)))
+                arrows.line(to: p(CGFloat(c[2].0), CGFloat(c[2].1)))
+            }
+            arrows.lineWidth = 2
+            arrows.lineCapStyle = .round
+            arrows.lineJoinStyle = .round
+            NSColor.black.setStroke()
+            arrows.stroke()
+            let r = 7 * u
+            let c = p(54, 54)
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)).fill()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }()
+
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var m = Model()
 
@@ -581,7 +607,7 @@ struct HitherApp: App {
         MenuBarExtra {
             Panel(m: m)
         } label: {
-            Image(systemName: "arrow.down.circle")
+            Image(nsImage: HitherApp.mark)
         }
         .menuBarExtraStyle(.window)
     }
