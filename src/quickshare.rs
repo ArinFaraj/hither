@@ -1114,8 +1114,10 @@ async fn serve(host: Arc<dyn Host>, tcp: TcpStream) -> Result<()> {
             Some(ok) = consent.recv() => {
                 match incoming.as_mut() {
                     Some(Incoming::Files(files)) if ok => {
+                        let inbox = host.inbox();
                         for p in files.values_mut() {
-                            p.file = Some(tokio::fs::File::create(&p.part).await.with_context(|| format!("create {}", p.part.display()))?);
+                            let (dest, part, f) = store::reserve(&inbox, &p.name).with_context(|| format!("save {}", p.name))?;
+                            (p.dest, p.part, p.file) = (dest, part, Some(tokio::fs::File::from_std(f)));
                         }
                     }
                     _ => {}
@@ -1166,6 +1168,7 @@ async fn serve(host: Arc<dyn Host>, tcp: TcpStream) -> Result<()> {
                             }
                             continue;
                         }
+                        ensure!(buffers.contains_key(&id) || buffers.len() < 8, "too many open payloads");
                         let buf = buffers.entry(id).or_default();
                         ensure!(chunk.offset == Some(buf.len() as i64), "bytes offset");
                         ensure!(buf.len() + body.len() <= MAX_FRAME, "bytes payload too large");
@@ -1205,9 +1208,7 @@ async fn serve(host: Arc<dyn Host>, tcp: TcpStream) -> Result<()> {
                                     let mut files = HashMap::new();
                                     for f in &intro.file_metadata {
                                         let name = f.name.clone().unwrap_or_else(|| "file".into());
-                                        let dest = store::unique_path(&inbox, &name);
-                                        let part = dest.with_file_name(format!(".{}.part", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
-                                        files.insert(f.payload_id.context("no file payload id")?, Pending { name, size: f.size.unwrap_or(0), dest, part, file: None, got: 0 });
+                                        files.insert(f.payload_id.context("no file payload id")?, Pending { name, size: f.size.unwrap_or(0), dest: PathBuf::new(), part: PathBuf::new(), file: None, got: 0 });
                                     }
                                     incoming = Some(Incoming::Files(files));
                                 } else {
@@ -1237,7 +1238,7 @@ async fn serve(host: Arc<dyn Host>, tcp: TcpStream) -> Result<()> {
         }
     };
     if let Some(Incoming::Files(files)) = incoming {
-        for p in files.values() {
+        for p in files.values().filter(|p| p.file.is_some()) {
             let _ = tokio::fs::remove_file(&p.part).await;
         }
     }

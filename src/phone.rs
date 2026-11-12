@@ -1,4 +1,5 @@
 use crate::adb;
+use crate::clip::{self, Clip};
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64;
 use std::collections::VecDeque;
@@ -23,8 +24,10 @@ pub struct Session {
 
 pub struct ClipEvent {
     pub serial: String,
-    pub text: String,
+    pub clip: Clip,
 }
+
+pub const CLIP_URI: &str = "content://drop.android.clip/in";
 
 fn remote_jar() -> String {
     use std::hash::{Hash, Hasher};
@@ -100,7 +103,18 @@ impl Session {
                 let text = || BASE64.decode(arg.as_bytes()).ok().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
                 match op {
                     "C" => {
-                        let _ = events.send(ClipEvent { serial: reader.serial.clone(), text: text() });
+                        let _ = events.send(ClipEvent { serial: reader.serial.clone(), clip: Clip::Text(text()) });
+                    }
+                    "I" => {
+                        let (uri, transport, serial, events) = (text(), reader.transport.clone(), reader.serial.clone(), events.clone());
+                        tokio::spawn(async move {
+                            match adb::read_uri(&transport, &uri, clip::MAX_IMAGE).await {
+                                Ok(b) => {
+                                    let _ = events.send(ClipEvent { serial, clip: Clip::Image(b) });
+                                }
+                                Err(e) => eprintln!("image clipboard on {serial}: {e:#}"),
+                            }
+                        });
                     }
                     "K" | "V" => {
                         if let Some(w) = reader.waiters.lock().unwrap().pop_front() {
@@ -148,8 +162,11 @@ impl Session {
         }
     }
 
-    pub async fn set_clip(&self, text: &str) -> Result<()> {
-        self.request('S', text).await.map(|_| ())
+    pub async fn set(&self, clip: &Clip) -> Result<()> {
+        match clip {
+            Clip::Text(t) => self.request('S', t).await.map(|_| ()),
+            Clip::Image(b) => adb::write_uri(&self.transport, CLIP_URI, b).await,
+        }
     }
 
     pub async fn get_clip(&self) -> Result<String> {

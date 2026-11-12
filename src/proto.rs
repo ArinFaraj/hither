@@ -11,6 +11,7 @@ pub enum Msg {
     Pair { code: String, name: String },
     File { name: String, size: u64 },
     Clip { text: String },
+    ClipImage { size: u64 },
     Ok { name: Option<String>, detail: Option<String> },
     Err { error: String },
 }

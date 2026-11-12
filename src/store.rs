@@ -9,8 +9,6 @@ pub fn data_dir() -> PathBuf {
     let home = home();
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/drop")
-    } else if cfg!(windows) {
-        std::env::var("APPDATA").map(PathBuf::from).unwrap_or(home).join("drop")
     } else {
         std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -59,6 +57,8 @@ pub struct Config {
     pub quickshare: Option<crate::localsend::Mode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub localsend_trusted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshots: Option<bool>,
 }
 
 impl Config {
@@ -75,6 +75,7 @@ impl Config {
             localsend: None,
             quickshare: None,
             localsend_trusted: Vec::new(),
+            screenshots: None,
         };
         cfg.save()?;
         Ok(cfg)
@@ -139,7 +140,7 @@ fn host_name() -> String {
         .unwrap_or_else(|| "device".into())
 }
 
-pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
+fn clean_name(name: &str) -> String {
     let clean: String = Path::new(name)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -147,16 +148,74 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':'))
         .collect();
-    let clean = if clean.is_empty() || clean.starts_with('.') { format!("file{clean}") } else { clean };
-    let first = dir.join(&clean);
-    if !first.exists() {
-        return first;
-    }
+    if clean.is_empty() || clean.starts_with('.') { format!("file{clean}") } else { clean }
+}
+
+fn candidates(dir: &Path, name: &str) -> impl Iterator<Item = PathBuf> {
+    let clean = clean_name(name);
     let p = Path::new(&clean);
     let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    (1..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
-        .unwrap()
+    let dir = dir.to_path_buf();
+    std::iter::once(dir.join(&clean)).chain((1..).map(move |n| dir.join(format!("{stem} ({n}){ext}"))))
+}
+
+fn part_path(dest: &Path) -> PathBuf {
+    dest.with_file_name(format!(".{}.part", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
+}
+
+pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    candidates(dir, name).find(|p| !p.exists()).expect("endless candidates")
+}
+
+pub fn reserve(dir: &Path, name: &str) -> std::io::Result<(PathBuf, PathBuf, std::fs::File)> {
+    for dest in candidates(dir, name) {
+        if dest.exists() {
+            continue;
+        }
+        let part = part_path(&dest);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(f) => return Ok((dest, part, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+pub fn menu_key() -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = data_dir();
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let path = dir.join("menu-key");
+    if let Ok(k) = std::fs::read_to_string(&path) {
+        if !k.trim().is_empty() {
+            return Ok(k.trim().to_string());
+        }
+    }
+    let key = data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>());
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    f.write_all(key.as_bytes())?;
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserve_never_hands_out_the_same_name_twice() {
+        let dir = std::env::temp_dir().join(format!("drop-reserve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, _, _) = reserve(&dir, "photo.jpg").unwrap();
+        let (b, _, _) = reserve(&dir, "photo.jpg").unwrap();
+        let (c, _, _) = reserve(&dir, "../../photo.jpg").unwrap();
+        assert_eq!(a, dir.join("photo.jpg"));
+        assert_eq!(b, dir.join("photo (1).jpg"));
+        assert_eq!(c, dir.join("photo (2).jpg"));
+        let (d, _, _) = reserve(&dir, ".hidden").unwrap();
+        assert_eq!(d, dir.join("file.hidden"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

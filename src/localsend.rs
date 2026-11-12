@@ -1,5 +1,5 @@
 use crate::store;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::combinators::BoxBody;
@@ -52,7 +52,10 @@ pub trait Host: Send + Sync + 'static {
     fn trust(&self, fingerprint: &str);
     fn received(&self, from: &str, path: &Path);
     fn text(&self, from: &str, text: &str);
+    fn image(&self, from: &str, png: Vec<u8>);
 }
+
+pub const CLIP_IMAGE: &str = ".drop-clipboard.png";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Peer {
@@ -393,7 +396,7 @@ pub async fn ask(title: &str, text: &str, buttons: &[&str]) -> Option<String> {
         if s.contains("gave up:true") {
             return None;
         }
-        return s.split("button returned:").nth(1).map(|r| r.split(", gave up").next().unwrap_or("").trim().to_string());
+        s.split("button returned:").nth(1).map(|r| r.split(", gave up").next().unwrap_or("").trim().to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -470,7 +473,7 @@ impl LocalSend {
         Info {
             alias: self.host.alias(),
             version: VERSION.into(),
-            device_model: Some(if cfg!(target_os = "macos") { "macOS" } else if cfg!(windows) { "Windows" } else { "Linux" }.into()),
+            device_model: Some(if cfg!(target_os = "macos") { "macOS" } else { "Linux" }.into()),
             device_type: Some("desktop".into()),
             fingerprint: self.fingerprint.clone(),
             port: PORT,
@@ -636,7 +639,16 @@ impl LocalSend {
                 return Ok(reply(StatusCode::NO_CONTENT, None));
             }
         }
-        if !trusted {
+        let clip_image = p.files.len() == 1
+            && p.files.values().next().is_some_and(|f| f.file_name == CLIP_IMAGE && f.file_type.starts_with("image/"));
+        if clip_image {
+            if p.files.values().next().is_some_and(|f| f.size > crate::clip::MAX_IMAGE) {
+                return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, Some(json!({"message": "Image too large"}))));
+            }
+            if !trusted && ask("drop", &format!("{from} sent you an image for the clipboard"), &["Ignore", "Copy"]).await.as_deref() != Some("Copy") {
+                return Ok(reply(StatusCode::FORBIDDEN, Some(json!({"message": "Rejected"}))));
+            }
+        } else if !trusted {
             let total: u64 = p.files.values().map(|f| f.size).sum();
             let mut names: Vec<&str> = p.files.values().map(|f| f.file_name.as_str()).collect();
             names.sort();
@@ -675,14 +687,19 @@ impl LocalSend {
         };
         let inbox = self.host.inbox();
         tokio::fs::create_dir_all(&inbox).await?;
-        let dest = store::unique_path(&inbox, &file.file_name);
-        let part = dest.with_file_name(format!(".{}.part", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
-        let mut out = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&part).await?);
+        let (dest, part, f) = {
+            let (inbox, name) = (inbox.clone(), file.file_name.clone());
+            tokio::task::spawn_blocking(move || store::reserve(&inbox, &name)).await??
+        };
+        let mut out = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::from_std(f));
         let mut hasher = file.sha256.as_ref().map(|_| Sha256::new());
         let mut body = req.into_body();
+        let mut got = 0u64;
         let result: Result<()> = async {
             while let Some(frame) = body.frame().await {
                 if let Ok(data) = frame?.into_data() {
+                    got += data.len() as u64;
+                    ensure!(got <= file.size, "{} is longer than announced", file.file_name);
                     if let Some(h) = hasher.as_mut() {
                         h.update(&data);
                     }
@@ -704,8 +721,14 @@ impl LocalSend {
                 return Ok(reply(StatusCode::UNPROCESSABLE_ENTITY, Some(json!({"message": "Checksum mismatch"}))));
             }
         }
-        tokio::fs::rename(&part, &dest).await?;
-        self.host.received(&from, &dest);
+        if file.file_name == CLIP_IMAGE {
+            let png = tokio::fs::read(&part).await;
+            let _ = tokio::fs::remove_file(&part).await;
+            self.host.image(&from, png?);
+        } else {
+            tokio::fs::rename(&part, &dest).await?;
+            self.host.received(&from, &dest);
+        }
         {
             let mut s = self.session.lock().unwrap();
             if let Some(u) = s.as_mut().filter(|u| &u.id == sid) {

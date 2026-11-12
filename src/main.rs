@@ -24,6 +24,10 @@ usage:
   drop clip set <text|->           set the clipboard here (it syncs to your devices)
   drop clip send <device> <text|-> put text on one device's clipboard
   drop clip on|off [device]        turn clipboard sync on or off
+  drop clip image <file> [device]  put an image on the clipboard (here, or on one device)
+  drop clip save <file>            save the image on the clipboard here as a PNG
+  drop screenshots [on|off]        put new screenshots on the clipboard so they sync
+  drop android install [device]    install the drop app on a phone over adb
   drop type <device> <text|->      type text on a phone
   drop key <device> <key>...       press keys (enter, back, home, tab, del, up, ...)
   drop pair                        show a ticket for another device to join
@@ -34,6 +38,7 @@ usage:
   drop localsend [ask|always|off]  let LocalSend apps nearby see this device and send to it
   drop quickshare [ask|always|off] let Android phones nearby send here with Quick Share
   drop airdrop <file>...           send files with AirDrop (macOS, opens the AirDrop picker)
+  drop airdrop                     send the clipboard (text, a link or an image) with AirDrop
   drop status | recent | stop
   drop daemon                      run the background service
 
@@ -65,8 +70,10 @@ fn main() {
         }
         return;
     }
-    if args.first().map(String::as_str) == Some("airdrop") {
-        if let Err(e) = airdrop(&args[1..]) {
+    let clip_airdrop = matches!(args.iter().map(String::as_str).collect::<Vec<_>>().as_slice(), ["clip", "send", d] if d.eq_ignore_ascii_case("airdrop"));
+    if clip_airdrop || args.first().map(String::as_str) == Some("airdrop") {
+        let files = if clip_airdrop { &[][..] } else { &args[1..] };
+        if let Err(e) = airdrop(files) {
             eprintln!("drop: {e:#}");
             std::process::exit(1);
         }
@@ -103,11 +110,16 @@ fn main() {
 }
 
 fn airdrop(files: &[String]) -> Result<()> {
-    if files.is_empty() {
-        bail!("usage: drop airdrop <file>...");
-    }
     if !cfg!(target_os = "macos") {
         bail!("AirDrop is only on macOS");
+    }
+    if files.is_empty() {
+        let url = format!("dropmenu://airdrop-clipboard?key={}", store::menu_key()?);
+        let ok = std::process::Command::new("open").args(["-b", "local.drop.menu", &url]).status()?.success();
+        if !ok {
+            bail!("could not reach Drop.app (install it with scripts/build-mac-app.sh)");
+        }
+        return Ok(());
     }
     let paths = files
         .iter()
@@ -167,6 +179,13 @@ fn run(args: &[String]) -> Result<Option<Value>> {
         ["clip", "send", to, ..] => json!({"cmd": "clip_set", "to": to, "text": text_arg(&args[3..])?}),
         ["clip", on @ ("on" | "off")] => json!({"cmd": "clip_sync", "on": *on == "on"}),
         ["clip", on @ ("on" | "off"), dev] => json!({"cmd": "clip_sync", "on": *on == "on", "device": dev}),
+        ["clip", "image", file] => json!({"cmd": "clip_image", "path": absolute(file)?}),
+        ["clip", "image", file, dev] => json!({"cmd": "clip_image", "path": absolute(file)?, "to": dev}),
+        ["clip", "save", file] => json!({"cmd": "clip_save", "path": absolute(file)?}),
+        ["android", "install"] => json!({"cmd": "android_install"}),
+        ["android", "install", dev] => json!({"cmd": "android_install", "device": dev}),
+        ["screenshots"] => json!({"cmd": "screenshots"}),
+        ["screenshots", v @ ("on" | "off")] => json!({"cmd": "screenshots", "on": *v == "on"}),
         ["type", to, ..] => json!({"cmd": "type", "to": to, "text": text_arg(&args[2..])?}),
         ["key", to, keys @ ..] if !keys.is_empty() => json!({"cmd": "key", "to": to, "keys": keys}),
         ["pair"] => json!({"cmd": "pair_start"}),
@@ -180,6 +199,11 @@ fn run(args: &[String]) -> Result<Option<Value>> {
         _ => bail!("unknown command: {}", args.join(" ")),
     };
     Ok(Some(req))
+}
+
+fn absolute(p: &str) -> Result<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(p);
+    Ok(if p.is_relative() { std::env::current_dir()?.join(p) } else { p })
 }
 
 fn connect() -> Result<UnixStream> {
@@ -279,13 +303,22 @@ fn print_human(req: &Value, r: &Value) {
         }
         "get" => println!("{}", s(&r["saved"])),
         "clip_get" => {
-            if let Some(t) = r["text"].as_str() {
+            if let Some(n) = r["image"].as_f64() {
+                println!("(an image, {}; save it with `drop clip save <file>`)", human_bytes(n));
+            } else if let Some(t) = r["text"].as_str() {
                 print!("{t}");
                 if !t.ends_with('\n') {
                     println!();
                 }
             }
         }
+        "clip_save" => println!("{}", s(&r["saved"])),
+        "android_install" => println!("installed the drop app on {}", s(&r["device"])),
+        "screenshots" => match (r["screenshots"] == true, r["dir"].as_str()) {
+            (true, Some(d)) => println!("screenshots: on, new ones in {d} go to the clipboard"),
+            (true, None) => println!("screenshots: on"),
+            (false, _) => println!("screenshots: off"),
+        },
         "clip_sync" => println!("clipboard sync {}", if r["clip"] == true { "on" } else { "off" }),
         "pair_start" => {
             println!("on the other device run:\n\n  drop pair {}\n", s(&r["ticket"]));

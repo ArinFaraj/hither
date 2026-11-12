@@ -2,6 +2,7 @@ package drop;
 
 import android.content.ClipData;
 import android.content.IOnPrimaryClipChangedListener;
+import android.net.Uri;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Base64;
@@ -21,6 +22,8 @@ public final class Helper {
     private static Object input;
     private static Method inject;
     private static volatile String lastSet;
+    private static volatile String lastImage;
+    private static final String OWN = "drop.android.clip";
     private static final PrintStream out = new PrintStream(System.out, true);
 
     public static void main(String[] args) throws Exception {
@@ -135,12 +138,32 @@ public final class Helper {
         call("setPrimaryClip", ClipData.newPlainText("drop", text));
     }
 
+    private static String imageUri(ClipData clip) {
+        if (clip == null || clip.getItemCount() == 0 || clip.getDescription() == null) return null;
+        if (!clip.getDescription().hasMimeType("image/*")) return null;
+        Uri u = clip.getItemAt(0).getUri();
+        if (u == null || (OWN.equals(u.getAuthority()) && u.getPath() != null && u.getPath().startsWith("/in"))) return null;
+        return u.toString();
+    }
+
     private static boolean listen() {
         IOnPrimaryClipChangedListener l = new IOnPrimaryClipChangedListener.Stub() {
             @Override
             public void dispatchPrimaryClipChanged() {
                 try {
-                    String t = getClip();
+                    ClipData clip = (ClipData) call("getPrimaryClip", null);
+                    String img = imageUri(clip);
+                    if (img != null) {
+                        if (img.equals(lastImage)) return;
+                        lastImage = img;
+                        lastSet = null;
+                        say("I " + b64(img));
+                        return;
+                    }
+                    lastImage = null;
+                    if (clip == null || clip.getItemCount() == 0) return;
+                    CharSequence cs = clip.getItemAt(0).getText();
+                    String t = cs == null ? null : cs.toString();
                     if (t == null || t.equals(lastSet)) return;
                     lastSet = t;
                     say("C " + b64(t));

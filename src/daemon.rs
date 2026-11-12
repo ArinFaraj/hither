@@ -3,7 +3,8 @@ use crate::store::{self, Config, Device};
 use crate::phone::{self, ClipEvent, Session};
 use crate::localsend::{self, LocalSend, Mode};
 use crate::quickshare::{self, QuickShare};
-use crate::{adb, clip};
+use crate::clip::{self, Clip};
+use crate::adb;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::{Connection, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+const APK: &[u8] = include_bytes!("../assets/drop.apk");
 const PAIR_WINDOW: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -29,6 +31,8 @@ pub enum Req {
     Get { from: String, path: String, dest: Option<PathBuf> },
     ClipGet { from: Option<String> },
     ClipSet { text: String, to: Option<String> },
+    ClipImage { path: PathBuf, to: Option<String> },
+    ClipSave { path: PathBuf },
     ClipSync { on: bool, device: Option<String> },
     Type { to: String, text: String },
     Key { to: String, keys: Vec<String> },
@@ -38,6 +42,8 @@ pub enum Req {
     Forget { device: String },
     Localsend { mode: Option<Mode> },
     Quickshare { mode: Option<Mode> },
+    Screenshots { on: Option<bool> },
+    AndroidInstall { device: Option<String> },
     Stop,
 }
 
@@ -91,7 +97,7 @@ impl localsend::Host for LsHost {
     fn received(&self, from: &str, path: &Path) {
         if let Some(s) = self.0.upgrade() {
             s.log("file_in", from, path.display().to_string());
-            notify(&format!("From {from}"), &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            notify(from, &format!("Sent you {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()), Note::File(path));
             eprintln!("got {} from {from} over LocalSend", path.display());
         }
     }
@@ -100,12 +106,32 @@ impl localsend::Host for LsHost {
         let Some(s) = self.0.upgrade() else { return };
         s.log("clip_in", from, format!("{} chars", text.chars().count()));
         if clip::available() {
-            let t = text.to_string();
-            tokio::task::spawn_blocking(move || clip::set(&t));
-            notify(&format!("Copied text from {from}"), &text.chars().take(120).collect::<String>());
+            let c = Clip::Text(text.to_string());
+            tokio::task::spawn_blocking(move || clip::set(&c));
+            notify(&format!("Clipboard from {from}"), &text.chars().take(200).collect::<String>(), Note::Plain);
         } else {
             let inbox = s.cfg.lock().unwrap().inbox.clone();
             let _ = std::fs::write(store::unique_path(&inbox, &format!("{from}.txt")), text);
+        }
+    }
+
+    fn image(&self, from: &str, png: Vec<u8>) {
+        let Some(s) = self.0.upgrade() else { return };
+        let c = Clip::Image(png);
+        s.log("clip_in", from, c.describe());
+        if clip::available() {
+            let from = from.to_string();
+            tokio::task::spawn_blocking(move || {
+                let Clip::Image(b) = &c else { return };
+                let Some(png) = clip::to_png(b) else { return };
+                let thumb = std::env::temp_dir().join("drop-clipboard.png");
+                let shown = std::fs::write(&thumb, &png).is_ok();
+                clip::set(&Clip::Image(png));
+                notify(&format!("Clipboard from {from}"), "Image copied, ready to paste", if shown { Note::Image(&thumb) } else { Note::Plain });
+            });
+        } else if let Clip::Image(b) = c {
+            let inbox = s.cfg.lock().unwrap().inbox.clone();
+            let _ = std::fs::write(store::unique_path(&inbox, &format!("{from}.png")), b);
         }
     }
 }
@@ -220,6 +246,7 @@ pub async fn run() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
+    store::menu_key()?;
     let sock = store::sock_path();
     if tokio::net::UnixStream::connect(&sock).await.is_ok() {
         eprintln!("drop is already running");
@@ -260,7 +287,7 @@ pub async fn run() -> Result<()> {
         cfg: Mutex::new(cfg),
         pair: Mutex::new(None),
         conns: Default::default(),
-        last_clip: Mutex::new(clip::get().map(|t| clip::hash(&t)).unwrap_or(0)),
+        last_clip: Mutex::new(clip::get().map(|c| c.hash()).unwrap_or(0)),
         recent: Mutex::new(VecDeque::new()),
         adopt: adopt_tx,
         phones: Mutex::new(HashMap::new()),
@@ -275,7 +302,7 @@ pub async fn run() -> Result<()> {
         let st = st.clone();
         tokio::spawn(async move {
             while let Some(ev) = clip_rx.recv().await {
-                st.spread(Source::Phone(ev.serial), ev.text).await;
+                st.spread(Source::Phone(ev.serial), ev.clip).await;
             }
         });
     }
@@ -307,6 +334,8 @@ pub async fn run() -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     tokio::spawn(watch_airdrop(st.clone()));
+    #[cfg(target_os = "macos")]
+    tokio::spawn(watch_screenshots(st.clone()));
     st.start_localsend().await;
     st.start_quickshare().await;
 
@@ -391,8 +420,8 @@ async fn watch_clipboard(st: Arc<State>) {
         if !st.cfg.lock().unwrap().clip {
             continue;
         }
-        let Some(text) = clip::get() else { continue };
-        st.spread(Source::Local, text).await;
+        let Ok(Some(c)) = tokio::task::spawn_blocking(clip::get).await else { continue };
+        st.spread(Source::Local, c).await;
     }
 }
 
@@ -440,12 +469,97 @@ async fn watch_airdrop(st: Arc<State>) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn screenshot_dir() -> Option<PathBuf> {
+    let out = std::process::Command::new("defaults").args(["read", "com.apple.screencapture", "location"]).output().ok();
+    let set = out.filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let dir = match set.filter(|s| !s.is_empty()) {
+        Some(s) if s == "~" || s.starts_with("~/") => store::home().join(s.trim_start_matches('~').trim_start_matches('/')),
+        Some(s) => PathBuf::from(s),
+        None => store::home().join("Desktop"),
+    };
+    Some(dir)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screenshot_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn is_screenshot(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    let n = unsafe {
+        libc::getxattr(p.as_ptr(), c"com.apple.metadata:kMDItemIsScreenCapture".as_ptr(), std::ptr::null_mut(), 0, 0, 0)
+    };
+    n > 0
+}
+
+#[cfg(target_os = "macos")]
+async fn watch_screenshots(st: Arc<State>) {
+    let started = SystemTime::now();
+    let mut checked = std::collections::HashSet::new();
+    let mut last = None;
+    let mut dir = screenshot_dir();
+    let mut dir_checked = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if !st.screenshots_on() {
+            continue;
+        }
+        if dir_checked.elapsed() > Duration::from_secs(120) {
+            dir = screenshot_dir();
+            dir_checked = Instant::now();
+        }
+        let Some(d) = dir.clone() else { continue };
+        let Ok(m) = tokio::fs::metadata(&d).await.and_then(|m| m.modified()) else { continue };
+        if last == Some((d.clone(), m)) {
+            continue;
+        }
+        last = Some((d.clone(), m));
+        let Ok(mut rd) = tokio::fs::read_dir(&d).await else { continue };
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let path = e.path();
+            if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) || checked.contains(&path) {
+                continue;
+            }
+            checked.insert(path.clone());
+            let Ok(meta) = e.metadata().await else { continue };
+            if !meta.is_file() || meta.created().or_else(|_| meta.modified()).is_ok_and(|t| t < started) {
+                continue;
+            }
+            if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) || !is_screenshot(&path) {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(&path).await else { continue };
+            if bytes.len() as u64 > clip::MAX_IMAGE || !clip::is_png(&bytes) {
+                continue;
+            }
+            let c = Clip::Image(bytes);
+            let _ = tokio::task::spawn_blocking({
+                let c = c.clone();
+                move || clip::set(&c)
+            })
+            .await;
+            st.spread(Source::Local, c).await;
+        }
+    }
+}
+
 impl State {
-    async fn spread(&self, src: Source, text: String) {
-        if text.is_empty() || !self.cfg.lock().unwrap().clip {
+    async fn spread(&self, src: Source, clip: Clip) {
+        if clip.is_empty() || !self.cfg.lock().unwrap().clip {
             return;
         }
-        let h = clip::hash(&text);
+        let clip = match clip {
+            Clip::Image(b) if !clip::is_png(&b) => match tokio::task::spawn_blocking(move || clip::to_png(&b)).await {
+                Ok(Some(png)) => Clip::Image(png),
+                _ => return,
+            },
+            c => c,
+        };
+        let h = clip.hash();
         {
             let mut last = self.last_clip.lock().unwrap();
             if *last == h {
@@ -469,20 +583,21 @@ impl State {
             (cfg.devices.clone(), from)
         };
         if src != Source::Local && clip::available() {
-            let t = text.clone();
-            let _ = tokio::task::spawn_blocking(move || clip::set(&t)).await;
+            let c = clip.clone();
+            let _ = tokio::task::spawn_blocking(move || clip::set(&c)).await;
         }
         if src != Source::Local {
-            self.log("clip_in", &from, format!("{} chars", text.chars().count()));
+            self.log("clip_in", &from, clip.describe());
         }
         let Some(me) = self.me.upgrade() else { return };
+        let clip = Arc::new(clip);
         let to_net = !matches!(src, Source::Net(_));
         for d in devices.into_iter().filter(|d| d.clip) {
             if let (true, Some(id)) = (to_net, d.id.as_deref().and_then(|i| i.parse::<EndpointId>().ok())) {
                 if src != Source::Net(id) {
-                    let (me, text, d) = (me.clone(), text.clone(), d.clone());
+                    let (me, clip, d) = (me.clone(), clip.clone(), d.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = me.clip_to(&d, &text).await {
+                        if let Err(e) = me.clip_to(&d, &clip).await {
                             eprintln!("clipboard to {}: {e:#}", d.name);
                         }
                     });
@@ -490,15 +605,19 @@ impl State {
             }
             if let Some(serial) = d.serial.as_ref().filter(|s| src != Source::Phone((*s).clone())) {
                 if let Some(sess) = self.session(serial) {
-                    let text = text.clone();
+                    let clip = clip.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = sess.set_clip(&text).await {
+                        if let Err(e) = sess.set(&clip).await {
                             eprintln!("clipboard to phone {}: {e:#}", sess.serial);
                         }
                     });
                 }
             }
         }
+    }
+
+    fn screenshots_on(&self) -> bool {
+        self.cfg.lock().unwrap().screenshots.unwrap_or(cfg!(target_os = "macos"))
     }
 
     fn ls_mode(&self) -> Mode {
@@ -681,10 +800,25 @@ impl State {
         Ok(reply)
     }
 
-    async fn clip_to(&self, d: &Device, text: &str) -> Result<()> {
+    async fn clip_to(&self, d: &Device, clip: &Clip) -> Result<()> {
         let id: EndpointId = d.id.as_deref().context("no network id")?.parse()?;
-        self.request(id, &Msg::Clip { text: text.to_string() }).await?;
-        Ok(())
+        let bytes = match clip {
+            Clip::Text(text) => {
+                self.request(id, &Msg::Clip { text: text.clone() }).await?;
+                return Ok(());
+            }
+            Clip::Image(b) => b,
+        };
+        let conn = self.conn(id).await?;
+        let (mut s, mut r) = conn.open_bi().await?;
+        proto::write(&mut s, &Msg::ClipImage { size: bytes.len() as u64 }).await?;
+        s.write_all(bytes).await?;
+        s.finish()?;
+        match proto::read::<_, Msg>(&mut r).await? {
+            Msg::Err { error } if error.starts_with("unexpected") => bail!("{} runs an older drop without image clipboard", d.name),
+            Msg::Err { error } => bail!(error),
+            _ => Ok(()),
+        }
     }
 
     async fn serve_stream(
@@ -700,9 +834,25 @@ impl State {
             (_, None) => Err(anyhow!("not paired")),
             (Msg::Clip { text }, Some(dev)) => {
                 if dev.clip {
-                    self.spread(Source::Net(peer), text).await;
+                    self.spread(Source::Net(peer), Clip::Text(text)).await;
                 }
                 Ok(Msg::Ok { name: None, detail: None })
+            }
+            (Msg::ClipImage { size }, Some(dev)) => {
+                if size > clip::MAX_IMAGE {
+                    let _ = recv.stop(1u32.into());
+                    Err(anyhow!("image is too large"))
+                } else {
+                    let mut buf = Vec::with_capacity(size as usize);
+                    (&mut recv).take(size).read_to_end(&mut buf).await?;
+                    if buf.len() as u64 != size {
+                        bail!("image cut short");
+                    }
+                    if dev.clip {
+                        self.spread(Source::Net(peer), Clip::Image(buf)).await;
+                    }
+                    Ok(Msg::Ok { name: None, detail: None })
+                }
             }
             (Msg::File { name, size }, Some(dev)) => {
                 proto::write(&mut send, &Msg::Ok { name: None, detail: None }).await?;
@@ -711,7 +861,7 @@ impl State {
                     Ok(path) => {
                         let secs = started.elapsed().as_secs_f64();
                         self.log("file_in", &dev.name, path.display().to_string());
-                        notify(&format!("From {}", dev.name), &name);
+                        notify(&dev.name, &format!("Sent you {name}"), Note::File(&path));
                         eprintln!("got {} ({size} bytes, {secs:.1}s) from {}", path.display(), dev.name);
                         Ok(Msg::Ok { name: None, detail: Some(path.display().to_string()) })
                     }
@@ -733,13 +883,11 @@ impl State {
     async fn receive_file(&self, recv: &mut iroh::endpoint::RecvStream, name: &str, size: u64) -> Result<PathBuf> {
         let inbox = self.cfg.lock().unwrap().inbox.clone();
         tokio::fs::create_dir_all(&inbox).await?;
-        let dest = store::unique_path(&inbox, name);
-        let part = dest.with_file_name(format!(
-            ".{}.part",
-            dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        ));
-        let file = tokio::fs::File::create(&part).await?;
-        let mut out = tokio::io::BufWriter::with_capacity(1 << 20, file);
+        let (dest, part, file) = {
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || store::reserve(&inbox, &name)).await??
+        };
+        let mut out = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::from_std(file));
         let got = tokio::io::copy(&mut recv.take(size), &mut out).await;
         let flushed = out.flush().await;
         match (got, flushed) {
@@ -773,7 +921,7 @@ impl State {
             Ok(cfg.name.clone())
         })?;
         self.log("paired", name, "");
-        notify("Paired", name);
+        notify("Paired", &format!("{name} can now send to this device"), Note::Plain);
         Ok(Msg::Ok { name: Some(me), detail: None })
     }
 
@@ -843,19 +991,13 @@ impl State {
                 if let Some(ls) = self.ls() {
                     ls.nudge();
                     for p in ls.peers() {
-                        list.push(json!({
-                            "name": p.alias, "id": null, "serial": null, "clip": false, "helper": false,
-                            "via": [format!("localsend {}", p.ip)], "localsend": p.fingerprint, "type": p.device_type,
-                        }));
+                        merge_row(&mut list, &p.alias, format!("localsend {}", p.ip), "localsend", json!(p.fingerprint), p.device_type.as_deref());
                     }
                 }
                 if let Some(qs) = self.qs.lock().unwrap().clone().filter(|_| self.qs_mode() != Mode::Off) {
                     for p in qs.peers() {
                         let kind = match p.device_type { 1 | 5 => "mobile", 2 => "tablet", _ => "desktop" };
-                        list.push(json!({
-                            "name": p.name, "id": null, "serial": null, "clip": false, "helper": false,
-                            "via": [format!("quickshare {}", p.addr.ip())], "quickshare": p.addr.to_string(), "type": kind,
-                        }));
+                        merge_row(&mut list, &p.name, format!("quickshare {}", p.addr.ip()), "quickshare", json!(p.addr.to_string()), Some(kind));
                     }
                 }
                 Ok(json!({"devices": list}))
@@ -874,14 +1016,35 @@ impl State {
                         return Err(e);
                     }
                 };
+                let direct = phone.is_some() || dev.id.is_some();
+                if !direct {
+                    if let Some((ls, peer)) = self.ls_peer(&dev.name) {
+                        return self.send_localsend(&ls, &peer, &paths).await;
+                    }
+                    if let Some((qs, peer)) = self.qs_peer(&dev.name) {
+                        return self.send_quickshare(&qs, &peer, &paths).await;
+                    }
+                }
                 let mut results = Vec::new();
-                for path in paths {
+                for path in paths.iter() {
                     let started = Instant::now();
-                    let size = tokio::fs::metadata(&path).await.with_context(|| path.display().to_string())?.len();
+                    let size = tokio::fs::metadata(path).await.with_context(|| path.display().to_string())?.len();
                     if !path.is_file() {
                         bail!("{} is not a file", path.display());
                     }
-                    let (via, dest) = self.send_one(&dev, phone.as_ref(), &path, size).await?;
+                    let (via, dest) = match self.send_one(&dev, phone.as_ref(), path, size).await {
+                        Ok(r) => r,
+                        Err(e) if results.is_empty() => {
+                            if let Some((ls, peer)) = self.ls_peer(&dev.name) {
+                                return self.send_localsend(&ls, &peer, &paths).await;
+                            }
+                            if let Some((qs, peer)) = self.qs_peer(&dev.name) {
+                                return self.send_quickshare(&qs, &peer, &paths).await;
+                            }
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let secs = started.elapsed().as_secs_f64();
                     self.log("file_out", &dev.name, path.display().to_string());
                     results.push(json!({"file": path, "bytes": size, "secs": secs, "via": via, "dest": dest}));
@@ -902,7 +1065,73 @@ impl State {
                 self.log("file_in", &dev.name, dest.display().to_string());
                 Ok(json!({"device": dev.name, "saved": dest}))
             }
-            Req::ClipGet { from: None } => Ok(json!({"text": clip::get()})),
+            Req::ClipGet { from: None } => Ok(match tokio::task::spawn_blocking(clip::get).await? {
+                Some(Clip::Image(b)) => json!({"text": null, "image": b.len()}),
+                Some(Clip::Text(t)) => json!({"text": t}),
+                None => json!({"text": null}),
+            }),
+            Req::ClipSave { path } => match tokio::task::spawn_blocking(clip::get).await? {
+                Some(Clip::Image(b)) => {
+                    tokio::fs::write(&path, &b).await?;
+                    Ok(json!({"saved": path, "bytes": b.len()}))
+                }
+                _ => bail!("there is no image on the clipboard"),
+            },
+            Req::ClipImage { path, to } => {
+                let bytes = tokio::fs::read(&path).await.with_context(|| path.display().to_string())?;
+                if bytes.len() as u64 > clip::MAX_IMAGE {
+                    bail!("image is too large");
+                }
+                let png = tokio::task::spawn_blocking(move || clip::to_png(&bytes)).await?.context("that file is not an image drop can read")?;
+                let c = Clip::Image(png);
+                let Some(to) = to else {
+                    if !clip::available() {
+                        bail!("no clipboard on this device");
+                    }
+                    tokio::task::spawn_blocking(move || clip::set(&c)).await?;
+                    return Ok(json!({}));
+                };
+                let (dev, _) = self.resolve(&to).await?;
+                if let Some(sess) = dev.serial.as_deref().and_then(|s| self.session(s)) {
+                    sess.set(&c).await?;
+                } else if dev.id.is_some() {
+                    self.clip_to(&dev, &c).await?;
+                } else {
+                    bail!("{}'s clipboard is not reachable right now", dev.name);
+                }
+                Ok(json!({"device": dev.name}))
+            }
+            Req::AndroidInstall { device } => {
+                let phone = match device {
+                    Some(q) => {
+                        let (dev, phone) = self.resolve(&q).await?;
+                        phone.context(format!("{} is not connected over adb", dev.name))?
+                    }
+                    None => {
+                        let mut phones = self.sync_phones().await;
+                        match phones.len() {
+                            0 => bail!("no phone is connected over adb"),
+                            1 => phones.remove(0),
+                            _ => bail!("more than one phone is connected, name one: drop android install <device>"),
+                        }
+                    }
+                };
+                let apk = store::data_dir().join("drop.apk");
+                tokio::fs::write(&apk, APK).await?;
+                let r = adb::install(&phone.transport, &apk).await;
+                let _ = tokio::fs::remove_file(&apk).await;
+                r?;
+                Ok(json!({"device": phone.name}))
+            }
+            Req::Screenshots { on } => {
+                if let Some(on) = on {
+                    self.update_cfg(|c| {
+                        c.screenshots = Some(on);
+                        Ok(())
+                    })?;
+                }
+                Ok(json!({"screenshots": self.screenshots_on(), "dir": screenshot_dir()}))
+            }
             Req::ClipGet { from: Some(q) } => {
                 let (dev, _) = self.resolve(&q).await?;
                 let sess = dev.serial.as_deref().and_then(|s| self.session(s));
@@ -913,7 +1142,7 @@ impl State {
                 if !clip::available() {
                     bail!("no clipboard on this device");
                 }
-                tokio::task::spawn_blocking(move || clip::set(&text)).await?;
+                tokio::task::spawn_blocking(move || clip::set(&Clip::Text(text))).await?;
                 Ok(json!({}))
             }
             Req::ClipSet { text, to: Some(to) } => {
@@ -931,12 +1160,22 @@ impl State {
                         return Err(e);
                     }
                 };
-                if let Some(sess) = dev.serial.as_deref().and_then(|s| self.session(s)) {
-                    sess.set_clip(&text).await?;
+                let c = Clip::Text(text.clone());
+                let direct = if let Some(sess) = dev.serial.as_deref().and_then(|s| self.session(s)) {
+                    sess.set(&c).await
                 } else if dev.id.is_some() {
-                    self.clip_to(&dev, &text).await?;
+                    self.clip_to(&dev, &c).await
                 } else {
-                    bail!("{}'s clipboard is not reachable right now", dev.name);
+                    Err(anyhow!("{}'s clipboard is not reachable right now", dev.name))
+                };
+                if let Err(e) = direct {
+                    if let Some((ls, peer)) = self.ls_peer(&dev.name) {
+                        ls.send_text(&peer, &text).await?;
+                    } else if let Some((qs, peer)) = self.qs_peer(&dev.name) {
+                        qs.send_text(&peer, &text).await?;
+                    } else {
+                        return Err(e);
+                    }
                 }
                 Ok(json!({"device": dev.name}))
             }
@@ -1120,17 +1359,55 @@ impl State {
     }
 }
 
-fn notify(title: &str, body: &str) {
+fn merge_row(list: &mut Vec<Value>, name: &str, via: String, key: &str, val: Value, kind: Option<&str>) {
+    if let Some(row) = list.iter_mut().find(|r| r["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name))) {
+        if let Some(v) = row["via"].as_array_mut() {
+            v.push(via.into());
+        }
+        row[key] = val;
+        if row["type"].is_null() {
+            row["type"] = json!(kind);
+        }
+        return;
+    }
+    let mut row = json!({"name": name, "id": null, "serial": null, "clip": false, "helper": false, "via": [via], "type": kind});
+    row[key] = val;
+    list.push(row);
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum Note<'a> {
+    Plain,
+    File(&'a Path),
+    Image(&'a Path),
+}
+
+fn notify(title: &str, body: &str, note: Note) {
     #[cfg(target_os = "macos")]
     {
+        let enc = |s: &str| {
+            s.bytes()
+                .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+                .collect::<String>()
+        };
+        let key = store::menu_key().unwrap_or_default();
+        let mut url = format!("dropmenu://notify?key={key}&title={}&body={}", enc(title), enc(body));
+        match note {
+            Note::Plain => {}
+            Note::File(p) => url += &format!("&file={}", enc(&p.to_string_lossy())),
+            Note::Image(p) => url += &format!("&image={}", enc(&p.to_string_lossy())),
+        }
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        std::thread::spawn(move || {
+            let quiet = |c: &mut std::process::Command| {
+                c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+            };
+            if !quiet(std::process::Command::new("open").args(["-g", &url])) {
+                quiet(std::process::Command::new("osascript").args(["-e", &script]));
+            }
+        });
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (title, body);
+    let _ = (title, body, note);
 }

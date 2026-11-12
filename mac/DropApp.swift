@@ -2,6 +2,7 @@ import AppKit
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
+import UserNotifications
 
 struct Device: Identifiable, Hashable {
     let id: String
@@ -28,11 +29,103 @@ enum AirDrop {
         s.perform(withItems: items)
         return true
     }
+
+    @MainActor
+    static func shareClipboard() -> String? {
+        let pb = NSPasteboard.general
+        if let text = pb.string(forType: .string), !text.isEmpty {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.contains(where: \.isWhitespace), let url = URL(string: trimmed), url.scheme == "http" || url.scheme == "https" {
+                if share([url]) { return nil }
+            }
+            if share([text]) { return nil }
+            guard let file = temp("Clipboard.txt", Data(text.utf8)) else { return "Could not save the text" }
+            return share([file]) ? nil : "AirDrop can't send this"
+        }
+        if let img = NSImage(pasteboard: pb), let tiff = img.tiffRepresentation,
+           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+            guard let file = temp("Clipboard.png", png) else { return "Could not save the image" }
+            return share([file]) ? nil : "AirDrop can't send this"
+        }
+        return "Clipboard is empty"
+    }
+
+    private static func temp(_ name: String, _ data: Data) -> URL? {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("drop-airdrop", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(name)
+        return (try? data.write(to: url)) == nil ? nil : url
+    }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+enum Notifier {
+    static func post(_ url: URL) {
+        let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ k: String) -> String? { q.first { $0.name == k }?.value }
+        let content = UNMutableNotificationContent()
+        content.title = value("title") ?? "drop"
+        content.body = value("body") ?? ""
+        if let f = value("file") { content.userInfo = ["file": f] }
+        if let f = value("image") ?? value("file"), let a = attachment(URL(fileURLWithPath: f)) {
+            content.attachments = [a]
+        }
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
+    private static func attachment(_ src: URL) -> UNNotificationAttachment? {
+        guard let type = UTType(filenameExtension: src.pathExtension), type.conforms(to: .image) else { return nil }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("drop-notify", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let copy = dir.appendingPathComponent(UUID().uuidString).appendingPathExtension(src.pathExtension)
+        guard (try? FileManager.default.copyItem(at: src, to: copy)) != nil else { return nil }
+        return try? UNNotificationAttachment(identifier: "image", url: copy)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        let c = UNUserNotificationCenter.current()
+        c.delegate = self
+        c.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list]
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        guard let f = response.notification.request.content.userInfo["file"] as? String else { return }
+        let url = URL(fileURLWithPath: f)
+        await MainActor.run {
+            if FileManager.default.fileExists(atPath: f) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        }
+    }
+
+    private static func signed(_ u: URL) -> Bool {
+        let home = ProcessInfo.processInfo.environment["DROP_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/drop")
+        guard let want = try? String(contentsOf: home.appendingPathComponent("menu-key"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !want.isEmpty else { return false }
+        let got = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "key" }?.value
+        return got == want
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
-        _ = AirDrop.share(urls)
+        let commands = urls.filter { $0.scheme == "dropmenu" && Self.signed($0) }
+        for u in commands where u.host == "notify" { Notifier.post(u) }
+        if commands.contains(where: { $0.host == "airdrop-clipboard" }) {
+            Task { @MainActor in
+                if let err = AirDrop.shareClipboard() {
+                    let a = NSAlert()
+                    a.messageText = err
+                    NSApp.activate(ignoringOtherApps: true)
+                    a.runModal()
+                }
+            }
+            return
+        }
+        let files = urls.filter(\.isFileURL)
+        if !files.isEmpty { _ = AirDrop.share(files) }
     }
 }
 
@@ -96,12 +189,12 @@ final class Model: ObservableObject {
             let serial = $0["serial"] as? String
             let ls = $0["localsend"] as? String
             return Device(
-                id: ls ?? serial ?? $0["id"] as? String ?? $0["name"] as? String ?? "",
+                id: serial ?? $0["id"] as? String ?? ls ?? $0["name"] as? String ?? "",
                 name: $0["name"] as? String ?? "",
                 via: $0["via"] as? [String] ?? [],
                 clip: $0["clip"] as? Bool ?? true,
                 phone: serial != nil || $0["type"] as? String == "mobile",
-                foreign: ls != nil || $0["quickshare"] is String
+                foreign: serial == nil && !($0["id"] is String) && (ls != nil || $0["quickshare"] is String)
             )
         }
         if AirDrop.available { list.append(.airdropRow) }
@@ -138,11 +231,11 @@ final class Model: ObservableObject {
     }
 
     func sendClipboard(_ d: Device) async {
-        guard let text = NSPasteboard.general.string(forType: .string) else { return flash(d, "Clipboard is empty") }
         if d.airdrop {
-            if !AirDrop.share([text]) { flash(d, "AirDrop can't send this") }
+            if let err = AirDrop.shareClipboard() { flash(d, err) }
             return
         }
+        guard let text = NSPasteboard.general.string(forType: .string) else { return flash(d, "Clipboard is empty") }
         let r = await CLI.run(["clip", "send", d.id, "-"], input: text)
         flash(d, r["ok"] as? Bool == true ? "Clipboard sent" : r["error"] as? String ?? "Failed")
     }
@@ -340,7 +433,11 @@ struct DeviceRow: View {
                     .lineLimit(1)
             }
             Spacer()
-            if !d.clip && !d.foreign && !d.airdrop {
+            if hover && online {
+                Button { Task { await m.sendClipboard(d) } } label: { Image(systemName: "doc.on.clipboard.fill") }
+                    .buttonStyle(.borderless)
+                    .help("Send the clipboard to \(d.name)")
+            } else if !d.clip && !d.foreign && !d.airdrop {
                 Image(systemName: "doc.on.clipboard")
                     .foregroundStyle(.tertiary)
                     .help("Clipboard sync is off for this device")

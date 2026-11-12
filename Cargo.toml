@@ -3,7 +3,11 @@ name = "drop"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+rust-version = "1.85"
 description = "Send files, sync the clipboard and type on your own devices"
+readme = "README.md"
+keywords = ["clipboard", "file-transfer", "localsend", "quick-share", "iroh"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "drop"
@@ -40,8 +44,8 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSData", "NSDictionary", "NSArray"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSBitmapImageRep", "NSImageRep", "NSGraphics"] }
 
 [profile.release]
 opt-level = 3

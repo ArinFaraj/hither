@@ -16,7 +16,7 @@ pub struct Phone {
 pub fn adb_path() -> Option<PathBuf> {
     static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
     PATH.get_or_init(|| {
-        let exe = if cfg!(windows) { "adb.exe" } else { "adb" };
+        let exe = "adb";
         let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
@@ -112,6 +112,45 @@ pub async fn pull(transport: &str, remote: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+pub async fn read_uri(transport: &str, uri: &str, limit: u64) -> Result<Vec<u8>> {
+    let out = adb()?.args(["-s", transport, "exec-out", "content", "read", "--uri", uri]).output().await?;
+    if !out.status.success() || out.stdout.is_empty() {
+        bail!("reading {uri}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    if out.stdout.len() as u64 > limit {
+        bail!("image is too large");
+    }
+    Ok(out.stdout)
+}
+
+pub async fn write_uri(transport: &str, uri: &str, data: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = adb()?
+        .args(["-s", transport, "exec-in", "content", "write", "--uri", uri])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    stdin.write_all(data).await?;
+    drop(stdin);
+    let out = child.wait_with_output().await?;
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() || said.contains("Exception") || said.contains("Could not find provider") {
+        if said.contains("provider") {
+            bail!("the drop app is not installed on the phone (run: drop android install)");
+        }
+        bail!("writing {uri}: {}", said.trim());
+    }
+    Ok(())
+}
+
+pub async fn install(transport: &str, apk: &Path) -> Result<()> {
+    run(&["-s", transport, "install", "-r", "-g", &apk.to_string_lossy()]).await?;
+    let _ = run(&["-s", transport, "shell", "content", "query", "--uri", "content://drop.android.clip/start"]).await;
+    Ok(())
+}
+
 pub fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -125,7 +164,7 @@ pub async fn type_text(transport: &str, text: &str) -> Result<()> {
             continue;
         }
         if !line.is_ascii() {
-            bail!("adb can only type plain ASCII; install the drop app on the phone for other text");
+            bail!("adb can only type plain ASCII and the drop helper is not running on the phone");
         }
         let escaped: String = line
             .chars()

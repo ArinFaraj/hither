@@ -1,2 +1,4 @@
 target/
 helper/build/
+android/build/
+.DS_Store
