@@ -27,8 +27,12 @@ fetch() {
   curl -fsSL --proto '=https' --proto-redir '=https' -H "User-Agent: hither-install" "$@"
 }
 
-tag=$(fetch "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-[ -n "$tag" ] || fail "could not find the latest release"
+latest=$(fetch -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")
+tag=${latest##*/}
+case "$tag" in
+  v[0-9]*) ;;
+  *) fail "could not find the latest release" ;;
+esac
 version=${tag#v}
 name="hither-$version-$os-$arch.tar.gz"
 base="https://github.com/$REPO/releases/download/$tag"
