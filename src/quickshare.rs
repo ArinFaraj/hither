@@ -654,7 +654,7 @@ pub struct QuickShare {
     pub name: String,
     alias: String,
     mdns: mdns_sd::ServiceDaemon,
-    _advert: Advert,
+    _advert: crate::dnssd::Advert,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -680,7 +680,7 @@ impl QuickShare {
         let device_type = if cfg!(any(target_os = "android", target_os = "ios")) { 1 } else { 3 };
         let info = BASE64URL_NOPAD.encode(&endpoint_info(&host.alias(), device_type));
         let mdns = mdns_sd::ServiceDaemon::new()?;
-        let advert = Advert::new(&mdns, &instance, &id, port, &info)?;
+        let advert = crate::dnssd::Advert::new(&mdns, SERVICE, &instance, port, &[("n", info.as_str())])?;
         let peers: Arc<Mutex<HashMap<String, Peer>>> = Default::default();
         let events = mdns.browse(SERVICE)?;
         let browse = {
@@ -742,84 +742,6 @@ impl QuickShare {
 
     pub async fn send_text(&self, peer: &Peer, text: &str) -> Result<()> {
         send(peer.addr, &self.alias, Outgoing::Text(text.to_string())).await
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct Advert(*mut std::ffi::c_void);
-
-#[cfg(target_os = "macos")]
-unsafe impl Send for Advert {}
-#[cfg(target_os = "macos")]
-unsafe impl Sync for Advert {}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn DNSServiceRegister(
-        sd_ref: *mut *mut std::ffi::c_void,
-        flags: u32,
-        interface_index: u32,
-        name: *const std::ffi::c_char,
-        regtype: *const std::ffi::c_char,
-        domain: *const std::ffi::c_char,
-        host: *const std::ffi::c_char,
-        port: u16,
-        txt_len: u16,
-        txt_record: *const std::ffi::c_void,
-        callback: *const std::ffi::c_void,
-        context: *mut std::ffi::c_void,
-    ) -> i32;
-    fn DNSServiceRefDeallocate(sd_ref: *mut std::ffi::c_void);
-}
-
-#[cfg(target_os = "macos")]
-impl Advert {
-    fn new(_: &mdns_sd::ServiceDaemon, instance: &str, _: &[u8; 4], port: u16, info: &str) -> Result<Self> {
-        let entry = format!("n={info}");
-        ensure!(entry.len() < 256, "endpoint info too long");
-        let mut txt = vec![entry.len() as u8];
-        txt.extend_from_slice(entry.as_bytes());
-        let name = std::ffi::CString::new(instance)?;
-        let ty = std::ffi::CString::new("_FC9F5ED42C8A._tcp")?;
-        let mut sd = std::ptr::null_mut();
-        let err = unsafe {
-            DNSServiceRegister(
-                &mut sd,
-                0,
-                0,
-                name.as_ptr(),
-                ty.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                port.to_be(),
-                txt.len() as u16,
-                txt.as_ptr().cast(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            )
-        };
-        ensure!(err == 0 && !sd.is_null(), "DNSServiceRegister failed ({err})");
-        Ok(Advert(sd))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Advert {
-    fn drop(&mut self) {
-        unsafe { DNSServiceRefDeallocate(self.0) }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-struct Advert;
-
-#[cfg(not(target_os = "macos"))]
-impl Advert {
-    fn new(mdns: &mdns_sd::ServiceDaemon, instance: &str, id: &[u8; 4], port: u16, info: &str) -> Result<Self> {
-        let hostname = format!("hither-{}.local.", String::from_utf8_lossy(id).to_lowercase());
-        let svc = mdns_sd::ServiceInfo::new(SERVICE, instance, &hostname, "", port, &[("n", info)][..])?.enable_addr_auto();
-        mdns.register(svc)?;
-        Ok(Advert)
     }
 }
 

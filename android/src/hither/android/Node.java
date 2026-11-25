@@ -56,6 +56,9 @@ final class Node {
     private final Object sending = new Object();
     private final WifiManager.MulticastLock screenLock;
     private final WifiManager.MulticastLock pickLock;
+    private final Nsd nsd;
+    private boolean screenOn;
+    private boolean pickOn;
     private SSLServerSocket server;
     private DatagramChannel udp;
     private final Map<String, MembershipKey> joined = new HashMap<>();
@@ -71,6 +74,7 @@ final class Node {
         pickLock = wm.createMulticastLock("hither-pick");
         pickLock.setReferenceCounted(false);
         for (Peer p : Hither.known(app)) peers.put(p.fingerprint, p);
+        nsd = new Nsd(app, this);
     }
 
     static synchronized Node get(Context c) {
@@ -105,6 +109,7 @@ final class Node {
             pool.execute(() -> listen(m));
         }
         rejoin();
+        nsd.advertise(port);
         Log.i("hither", "receiving on port " + port);
     }
 
@@ -235,6 +240,7 @@ final class Node {
     void announce(boolean force) {
         String address = lanAddress();
         if (address == null) return;
+        if (running()) nsd.advertise(port);
         synchronized (this) {
             long now = SystemClock.elapsedRealtime();
             boolean moved = address != null && !address.equals(lastAddress);
@@ -318,14 +324,18 @@ final class Node {
         }
     }
 
-    void screen(boolean on) {
+    synchronized void screen(boolean on) {
         if (on) screenLock.acquire();
         else if (screenLock.isHeld()) screenLock.release();
+        screenOn = on;
+        nsd.browse(screenOn || pickOn);
     }
 
-    void picking(boolean on) {
+    synchronized void picking(boolean on) {
         if (on) pickLock.acquire();
         else if (pickLock.isHeld()) pickLock.release();
+        pickOn = on;
+        nsd.browse(screenOn || pickOn);
     }
 
     static List<NetworkInterface> lanInterfaces() {

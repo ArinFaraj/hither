@@ -2,6 +2,7 @@ mod adb;
 mod autostart;
 mod clip;
 mod daemon;
+mod dnssd;
 mod localsend;
 mod quickshare;
 mod phone;

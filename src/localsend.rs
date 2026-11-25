@@ -29,6 +29,7 @@ const GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
 const VERSION: &str = "2.2";
 const FRESH: Duration = Duration::from_secs(660);
 const API: &str = "/api/localsend/v2";
+const SERVICE: &str = "_localsend._tcp.local.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -174,6 +175,8 @@ pub struct LocalSend {
     udp: Arc<UdpSocket>,
     send_lock: Mutex<()>,
     last_announce: Mutex<Option<Instant>>,
+    mdns: Option<mdns_sd::ServiceDaemon>,
+    advert: Mutex<Option<crate::dnssd::Advert>>,
 }
 
 type Body = BoxBody<Bytes, std::io::Error>;
@@ -445,6 +448,7 @@ impl LocalSend {
             .await
             .with_context(|| format!("port {PORT} is taken (is the LocalSend app running?)"))?;
         let udp = Arc::new(bind_udp()?);
+        let mdns = mdns_sd::ServiceDaemon::new().map_err(|e| eprintln!("localsend: no DNS-SD: {e}")).ok();
         let ls = Arc::new(LocalSend {
             host,
             fingerprint: fingerprint(&cert),
@@ -457,7 +461,11 @@ impl LocalSend {
             udp,
             send_lock: Mutex::new(()),
             last_announce: Mutex::new(None),
+            mdns,
+            advert: Mutex::new(None),
         });
+        ls.advertise();
+        ls.browse();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
         {
             let ls = ls.clone();
@@ -507,6 +515,58 @@ impl LocalSend {
             protocol: "https".into(),
             download: false,
             announce,
+        }
+    }
+
+    fn advertise(&self) {
+        let Some(mdns) = &self.mdns else { return };
+        let info = self.info(None);
+        let model = info.device_model.clone().unwrap_or_default();
+        let entries = [
+            ("fingerprint", info.fingerprint.as_str()),
+            ("alias", info.alias.as_str()),
+            ("version", info.version.as_str()),
+            ("protocol", info.protocol.as_str()),
+            ("deviceType", "desktop"),
+            ("deviceModel", model.as_str()),
+        ];
+        match crate::dnssd::Advert::new(mdns, SERVICE, &info.alias, PORT, &entries) {
+            Ok(a) => *self.advert.lock().unwrap() = Some(a),
+            Err(e) => eprintln!("localsend: could not advertise over DNS-SD: {e:#}"),
+        }
+    }
+
+    fn browse(self: &Arc<Self>) {
+        let Some(mdns) = &self.mdns else { return };
+        let events = match mdns.browse(SERVICE) {
+            Ok(e) => e,
+            Err(e) => return eprintln!("localsend: could not browse DNS-SD: {e}"),
+        };
+        let ls = self.clone();
+        tokio::spawn(async move {
+            while let Ok(ev) = events.recv_async().await {
+                let mdns_sd::ServiceEvent::ServiceResolved(s) = ev else { continue };
+                let Some(fp) = s.get_property_val_str("fingerprint").map(str::to_uppercase) else { continue };
+                if fp == ls.fingerprint || !ls.on() {
+                    continue;
+                }
+                let (port, addrs) = (s.port, s.get_addresses_v4());
+                let ls = ls.clone();
+                tokio::spawn(async move { ls.found(addrs.into_iter().map(IpAddr::V4).collect(), port, &fp).await });
+            }
+        });
+    }
+
+    async fn found(&self, addrs: Vec<IpAddr>, port: u16, fp: &str) {
+        if self.peer(fp).is_some_and(|p| addrs.contains(&p.ip) && p.port == port && p.seen.elapsed() < Duration::from_secs(30)) {
+            return;
+        }
+        for ip in addrs {
+            let Some(peer) = self.add(ip, port, fp).await else { continue };
+            eprintln!("localsend: found {} at {ip} over DNS-SD", peer.alias);
+            let body = serde_json::to_vec(&self.info(None)).unwrap_or_default();
+            let _ = self.http(&peer, Method::POST, &format!("{API}/register"), json_body(body), None, Duration::from_secs(5)).await;
+            return;
         }
     }
 
