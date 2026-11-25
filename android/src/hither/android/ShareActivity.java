@@ -3,6 +3,8 @@ package hither.android;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.LinearLayout;
@@ -12,7 +14,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -22,11 +23,28 @@ public final class ShareActivity extends Activity {
     static final String EXTRA_PICK = "hither.pick";
 
     private final List<Peer> peers = new ArrayList<>();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Node.Listener listener = () -> main.post(this::refresh);
     private ArrayAdapter<Peer> adapter;
     private TextView status;
-    private volatile boolean searching = true;
+    private ProgressBar spin;
     private List<LocalSend.Item> items;
     private boolean pickOnly;
+    private boolean sending;
+    private int rounds;
+
+    private final Runnable search = new Runnable() {
+        @Override
+        public void run() {
+            Node.get(ShareActivity.this).announce(true);
+            if (++rounds < 6) {
+                main.postDelayed(this, 3000);
+            } else {
+                spin.setVisibility(View.GONE);
+                if (peers.isEmpty()) status.setText("No devices found. Is hither or LocalSend open on the same Wi-Fi?");
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle b) {
@@ -38,6 +56,7 @@ public final class ShareActivity extends Activity {
             finish();
             return;
         }
+        Receiver.start(this);
         int pad = (int) (20 * getResources().getDisplayMetrics().density);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -48,7 +67,7 @@ public final class ShareActivity extends Activity {
         root.addView(title);
         LinearLayout row = new LinearLayout(this);
         row.setPadding(0, pad / 2, 0, pad / 2);
-        ProgressBar spin = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        spin = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
         row.addView(spin);
         status = new TextView(this);
         status.setPadding(pad / 2, 0, 0, 0);
@@ -62,16 +81,31 @@ public final class ShareActivity extends Activity {
         root.addView(list, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (int) (280 * getResources().getDisplayMetrics().density)));
         setContentView(root);
         setFinishOnTouchOutside(true);
-        Peer saved = Hither.target(this);
-        if (saved != null) add(saved);
-        new Thread(() -> {
-            try {
-                while (searching) LocalSend.discover(this, 8000, p -> runOnUiThread(() -> add(p)));
-            } catch (IOException e) {
-                runOnUiThread(() -> status.setText("Discovery failed: " + e.getMessage()));
-            }
-            runOnUiThread(() -> spin.setVisibility(View.GONE));
-        }).start();
+        refresh();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (adapter == null) return;
+        Node node = Node.get(this);
+        node.addListener(listener);
+        node.picking(true);
+        node.pool.execute(() -> {
+            node.startQuietly();
+            node.scan(60_000);
+        });
+        rounds = 0;
+        main.post(search);
+    }
+
+    @Override
+    protected void onStop() {
+        main.removeCallbacks(search);
+        Node node = Node.get(this);
+        node.removeListener(listener);
+        node.picking(false);
+        super.onStop();
     }
 
     private List<LocalSend.Item> load(Intent i) {
@@ -99,34 +133,36 @@ public final class ShareActivity extends Activity {
         return "Send " + items.size() + " files";
     }
 
-    private void add(Peer p) {
-        for (int i = 0; i < peers.size(); i++) {
-            Peer q = peers.get(i);
-            if (q.fingerprint.equalsIgnoreCase(p.fingerprint) || q.alias.equalsIgnoreCase(p.alias)) {
-                peers.set(i, p);
-                adapter.notifyDataSetChanged();
-                return;
+    private void refresh() {
+        if (sending) return;
+        Peer target = Hither.target(this);
+        peers.clear();
+        for (Peer p : Node.get(this).peers()) {
+            if (!p.ip.isEmpty()) peers.add(p);
+        }
+        if (target != null) {
+            for (int i = 0; i < peers.size(); i++) {
+                if (peers.get(i).fingerprint.equalsIgnoreCase(target.fingerprint)) {
+                    peers.add(0, peers.remove(i));
+                    break;
+                }
             }
         }
-        peers.add(p);
         adapter.notifyDataSetChanged();
-        status.setText("Tap a device");
+        if (!peers.isEmpty()) status.setText("Tap a device");
     }
 
     private void pick(Peer p) {
-        searching = false;
+        sending = true;
+        main.removeCallbacks(search);
+        Hither.trust(this, p.fingerprint);
         Hither.setTarget(this, p);
+        Hither.remember(this, p);
         if (pickOnly) {
             finish();
             return;
         }
         status.setText("Sending to " + p.alias);
         Items.sendInBackground(this, p, items, this::finish);
-    }
-
-    @Override
-    protected void onDestroy() {
-        searching = false;
-        super.onDestroy();
     }
 }

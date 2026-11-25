@@ -29,10 +29,14 @@ final class Identity {
     private Identity(X509Certificate cert, PrivateKey key) throws GeneralSecurityException {
         this.cert = cert;
         this.key = key;
-        byte[] d = MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
+        fingerprint = fingerprint(cert.getEncoded());
+    }
+
+    static String fingerprint(byte[] der) throws GeneralSecurityException {
+        byte[] d = MessageDigest.getInstance("SHA-256").digest(der);
         StringBuilder sb = new StringBuilder();
         for (byte b : d) sb.append(String.format("%02X", b));
-        fingerprint = sb.toString();
+        return sb.toString();
     }
 
     static synchronized Identity get() throws GeneralSecurityException {
@@ -85,12 +89,17 @@ final class Identity {
 
             @Override
             public String chooseServerAlias(String type, Principal[] issuers, Socket s) {
-                return null;
+                return ALIAS;
+            }
+
+            @Override
+            public String chooseEngineServerAlias(String type, Principal[] issuers, SSLEngine e) {
+                return ALIAS;
             }
 
             @Override
             public String[] getServerAliases(String type, Principal[] issuers) {
-                return null;
+                return new String[] {ALIAS};
             }
         }};
     }

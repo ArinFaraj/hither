@@ -134,8 +134,20 @@ public final class ClipProvider extends ContentProvider {
         return "image/png";
     }
 
+    private static boolean shell() {
+        int uid = Binder.getCallingUid();
+        return uid == SHELL_UID || uid == 0;
+    }
+
     @Override
     public Cursor query(Uri u, String[] projection, String selection, String[] args, String sort) {
+        if ("/id".equals(u.getPath())) {
+            if (!shell()) return null;
+            Context c = getContext();
+            MatrixCursor m = new MatrixCursor(new String[] {"fingerprint", "port", "ip", "alias"}, 1);
+            m.addRow(new Object[] {Hither.fingerprint(c), Node.get(c).port(), Node.lanAddress(), Hither.name(c)});
+            return m;
+        }
         File f;
         try {
             f = file(u);
@@ -155,7 +167,25 @@ public final class ClipProvider extends ContentProvider {
 
     @Override
     public Uri insert(Uri u, ContentValues v) {
-        return null;
+        if (!"/trust".equals(u.getPath()) || !shell() || v == null) return null;
+        String fp = v.getAsString("fingerprint");
+        String alias = v.getAsString("alias");
+        if (fp == null || fp.isEmpty()) return null;
+        Context c = getContext();
+        Hither.trust(c, fp);
+        if (alias != null && Hither.target(c) == null) {
+            Peer p = new Peer();
+            p.alias = alias;
+            p.fingerprint = fp.toUpperCase(java.util.Locale.ROOT);
+            p.ip = "";
+            p.port = LocalSend.PORT;
+            p.https = true;
+            p.type = "desktop";
+            Hither.setTarget(c, p);
+        }
+        Receiver.start(c);
+        Node.get(c).announce(true);
+        return u;
     }
 
     @Override

@@ -46,7 +46,17 @@ public final class ShotJob extends JobService {
             try {
                 if (uris != null) {
                     for (int i = uris.length - 1; i >= 0; i--) {
-                        if (take(uris[i])) break;
+                        LocalSend.Item shot = take(uris[i]);
+                        if (shot == null) continue;
+                        Peer target = Hither.target(this);
+                        if (target != null) {
+                            try {
+                                Items.send(this, target, java.util.Collections.singletonList(shot));
+                            } catch (java.io.IOException e) {
+                                android.util.Log.w("hither", "sending the screenshot to " + target.alias + " failed", e);
+                            }
+                        }
+                        break;
                     }
                 }
             } finally {
@@ -62,38 +72,39 @@ public final class ShotJob extends JobService {
         return true;
     }
 
-    private boolean take(Uri u) {
+    private LocalSend.Item take(Uri u) {
         String[] cols = {
                 MediaStore.Images.Media.RELATIVE_PATH,
                 MediaStore.Images.Media.IS_PENDING,
                 MediaStore.Images.Media.DATE_ADDED,
                 MediaStore.Images.Media.MIME_TYPE,
         };
+        String mime;
         try (Cursor c = getContentResolver().query(u, cols, null, null, null)) {
-            if (c == null || !c.moveToFirst()) return false;
+            if (c == null || !c.moveToFirst()) return null;
             String path = c.getString(0);
-            if (path == null || !path.toLowerCase().contains("screenshot")) return false;
-            if (c.getInt(1) != 0) return false;
-            if (System.currentTimeMillis() / 1000 - c.getLong(2) > RECENT_SECONDS) return false;
-            String mime = c.getString(3);
-            if (mime == null || !mime.startsWith("image/")) return false;
+            if (path == null || !path.toLowerCase().contains("screenshot")) return null;
+            if (c.getInt(1) != 0) return null;
+            if (System.currentTimeMillis() / 1000 - c.getLong(2) > RECENT_SECONDS) return null;
+            mime = c.getString(3);
+            if (mime == null || !mime.startsWith("image/")) return null;
         } catch (RuntimeException e) {
-            return false;
+            return null;
         }
         File d = ClipProvider.dir(this, "shot");
         String name = ClipProvider.newName();
         File f = new File(d, name);
         try (InputStream in = getContentResolver().openInputStream(u); OutputStream out = new FileOutputStream(f)) {
-            if (in == null) return false;
+            if (in == null) return null;
             byte[] buf = new byte[65536];
             int n;
             while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
         } catch (Exception e) {
             f.delete();
-            return false;
+            return null;
         }
         ClipProvider.keepNewest(d, 4);
         ClipProvider.setClip(this, ClipProvider.uri("shot", name), "Screenshot");
-        return true;
+        return Items.file(f, Items.CLIP_IMAGE, mime);
     }
 }

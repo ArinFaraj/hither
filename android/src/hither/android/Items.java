@@ -127,8 +127,8 @@ final class Items {
         new Thread(() -> {
             String msg;
             try {
-                LocalSend.send(app, p, items, null);
-                msg = "Sent to " + p.alias;
+                Peer to = send(app, p, items);
+                msg = "Sent to " + to.alias;
             } catch (LocalSend.Rejected e) {
                 msg = e.getMessage();
             } catch (IOException e) {
@@ -140,5 +140,35 @@ final class Items {
                 if (after != null) after.run();
             });
         }).start();
+    }
+
+    static Peer send(Context c, Peer p, List<LocalSend.Item> items) throws IOException {
+        Node node = Node.get(c);
+        Peer seen = node.peer(p.fingerprint);
+        if (seen != null && seen.seen > p.seen) p = seen;
+        if (p.ip.isEmpty()) {
+            node.startQuietly();
+            Peer q = node.refresh(p, 6000);
+            if (q == null) throw new IOException(p.alias + " is not on this network");
+            p = q;
+        }
+        try {
+            LocalSend.send(c, p, items, null);
+            return p;
+        } catch (LocalSend.Rejected e) {
+            throw e;
+        } catch (IOException e) {
+            if (!unreachable(e)) throw e;
+            node.startQuietly();
+            Peer q = node.refresh(p, 6000);
+            if (q == null) throw e;
+            LocalSend.send(c, q, items, null);
+            return q;
+        }
+    }
+
+    private static boolean unreachable(IOException e) {
+        if (e instanceof java.net.ConnectException || e instanceof java.net.NoRouteToHostException || e instanceof java.net.UnknownHostException) return true;
+        return e instanceof java.net.SocketTimeoutException && String.valueOf(e.getMessage()).contains("connect");
     }
 }
