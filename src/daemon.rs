@@ -112,6 +112,7 @@ impl localsend::Host for LsHost {
         s.log("clip_in", from, format!("{} chars", text.chars().count()));
         if clip::available() {
             let c = Clip::Text(text.to_string());
+            *s.last_clip.lock().unwrap() = c.hash();
             tokio::task::spawn_blocking(move || clip::set(&c));
             notify(&format!("Clipboard from {from}"), &text.chars().take(200).collect::<String>(), Note::Plain);
         } else {
@@ -129,6 +130,7 @@ impl localsend::Host for LsHost {
             tokio::task::spawn_blocking(move || {
                 let Clip::Image(b) = &c else { return };
                 let Some(png) = clip::to_png(b) else { return };
+                *s.last_clip.lock().unwrap() = Clip::Image(png.clone()).hash();
                 let thumb = std::env::temp_dir().join("hither-clipboard.png");
                 let shown = std::fs::write(&thumb, &png).is_ok();
                 clip::set(&Clip::Image(png));
@@ -352,6 +354,17 @@ pub async fn run() -> Result<()> {
     #[cfg(target_os = "macos")]
     tokio::spawn(watch_screenshots(st.clone()));
     st.start_localsend().await;
+    {
+        let st = st.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if st.ls_error.lock().unwrap().is_some() {
+                    st.start_localsend().await;
+                }
+            }
+        });
+    }
     st.start_quickshare().await;
     tokio::spawn(watch_updates(st.clone()));
 
@@ -427,6 +440,50 @@ async fn watch_updates(st: Arc<State>) {
             }
         }
         tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+    }
+}
+
+fn column<'a>(row: &'a str, key: &str) -> Option<&'a str> {
+    let at = row.find(&format!("{key}="))? + key.len() + 1;
+    row[at..].split(", ").next().map(str::trim).filter(|v| !v.is_empty() && *v != "NULL")
+}
+
+async fn link_phone(st: Arc<State>, serial: String, transport: String) {
+    static LINKED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let Some(ls) = st.ls() else { return };
+    if !LINKED.get_or_init(Default::default).lock().unwrap().insert(serial.clone()) {
+        return;
+    }
+    let Ok(row) = adb::shell(&transport, "content query --uri content://hither.android.clip/id").await else { return };
+    let Some(fp) = column(&row, "fingerprint").filter(|f| f.len() == 64).map(str::to_uppercase) else {
+        LINKED.get().unwrap().lock().unwrap().remove(&serial);
+        return;
+    };
+    let me = st.cfg.lock().unwrap().name.clone();
+    let script = format!(
+        "cmd deviceidle whitelist +hither.android >/dev/null 2>&1; \
+         pm grant hither.android android.permission.POST_NOTIFICATIONS 2>/dev/null; \
+         pm grant hither.android android.permission.READ_MEDIA_IMAGES 2>/dev/null; \
+         content insert --uri content://hither.android.clip/trust --bind fingerprint:s:{} --bind alias:s:{}",
+        ls.fingerprint(),
+        adb::quote(&me)
+    );
+    if let Err(e) = adb::shell(&transport, &script).await {
+        eprintln!("linking {serial}: {e:#}");
+    }
+    let _ = st.update_cfg(|c| {
+        if let Some(d) = c.devices.iter_mut().find(|d| d.serial.as_deref() == Some(&serial)) {
+            d.localsend = Some(fp.clone());
+        }
+        if !c.localsend_trusted.iter().any(|f| f.eq_ignore_ascii_case(&fp)) {
+            c.localsend_trusted.push(fp.clone());
+        }
+        Ok(())
+    });
+    let ip = column(&row, "ip").and_then(|i| i.parse().ok());
+    let port = column(&row, "port").and_then(|p| p.parse().ok()).filter(|p| *p != 0);
+    if let (Some(ip), Some(port)) = (ip, port) {
+        ls.add(ip, port, &fp).await;
     }
 }
 
@@ -690,6 +747,17 @@ impl State {
                     });
                 }
             }
+            let from_it = d.serial.as_ref().is_some_and(|s| src == Source::Phone(s.clone()));
+            let live = d.serial.as_deref().and_then(|s| self.session(s)).is_some();
+            if let (false, false, None, Some(fp), Some(ls)) = (from_it, live, d.id.as_ref(), d.localsend.clone(), self.ls()) {
+                let (clip, name) = (clip.clone(), d.name.clone());
+                tokio::spawn(async move {
+                    let Some(peer) = ls.reach(&fp).await else { return };
+                    if let Err(e) = ls.send_clip(&peer, &clip).await {
+                        eprintln!("clipboard to {name}: {e:#}");
+                    }
+                });
+            }
             if let Some(serial) = d.serial.as_ref().filter(|s| src != Source::Phone((*s).clone())) {
                 if let Some(sess) = self.session(serial) {
                     let clip = clip.clone();
@@ -754,6 +822,15 @@ impl State {
                 *self.qs_error.lock().unwrap() = Some(format!("{e:#}"));
             }
         }
+    }
+
+    async fn ls_device(&self, dev: &Device) -> Option<(Arc<LocalSend>, localsend::Peer)> {
+        let ls = self.ls()?;
+        let peer = match &dev.localsend {
+            Some(fp) => ls.reach(fp).await,
+            None => ls.find(&dev.name),
+        }?;
+        Some((ls, peer))
     }
 
     fn ls_peer(&self, q: &str) -> Option<(Arc<LocalSend>, localsend::Peer)> {
@@ -834,6 +911,9 @@ impl State {
                 Ok(sess) => {
                     eprintln!("helper running on {} via {}", p.name, p.transport);
                     tokio::spawn(upgrade_app(p.name.clone(), p.transport.clone()));
+                    if let Some(me) = self.me.upgrade() {
+                        tokio::spawn(link_phone(me, p.serial.clone(), p.transport.clone()));
+                    }
                     self.phones.lock().unwrap().insert(p.serial.clone(), sess);
                 }
                 Err(e) => {
@@ -1004,7 +1084,7 @@ impl State {
         let me = self.update_cfg(|cfg| {
             match cfg.devices.iter_mut().find(|d| d.id.as_deref() == Some(&id)) {
                 Some(d) => d.name = name.to_string(),
-                None => cfg.devices.push(Device { name: name.to_string(), id: Some(id.clone()), serial: None, clip: true }),
+                None => cfg.devices.push(Device { name: name.to_string(), id: Some(id.clone()), serial: None, clip: true, localsend: None }),
             }
             Ok(cfg.name.clone())
         })?;
@@ -1018,7 +1098,7 @@ impl State {
         let _ = self.update_cfg(|cfg| {
             for p in &phones {
                 if !cfg.devices.iter().any(|d| d.serial.as_deref() == Some(&p.serial)) {
-                    cfg.devices.push(Device { name: p.name.clone(), id: None, serial: Some(p.serial.clone()), clip: true });
+                    cfg.devices.push(Device { name: p.name.clone(), id: None, serial: Some(p.serial.clone()), clip: true, localsend: None });
                 }
             }
             Ok(())
@@ -1109,7 +1189,7 @@ impl State {
                 };
                 let direct = phone.is_some() || dev.id.is_some();
                 if !direct {
-                    if let Some((ls, peer)) = self.ls_peer(&dev.name) {
+                    if let Some((ls, peer)) = self.ls_device(&dev).await {
                         return self.send_localsend(&ls, &peer, &paths).await;
                     }
                     if let Some((qs, peer)) = self.qs_peer(&dev.name) {
@@ -1126,7 +1206,7 @@ impl State {
                     let (via, dest) = match self.send_one(&dev, phone.as_ref(), path, size).await {
                         Ok(r) => r,
                         Err(e) if results.is_empty() => {
-                            if let Some((ls, peer)) = self.ls_peer(&dev.name) {
+                            if let Some((ls, peer)) = self.ls_device(&dev).await {
                                 return self.send_localsend(&ls, &peer, &paths).await;
                             }
                             if let Some((qs, peer)) = self.qs_peer(&dev.name) {
@@ -1187,6 +1267,8 @@ impl State {
                     sess.set(&c).await?;
                 } else if dev.id.is_some() {
                     self.clip_to(&dev, &c).await?;
+                } else if let Some((ls, peer)) = self.ls_device(&dev).await {
+                    ls.send_clip(&peer, &c).await?;
                 } else {
                     bail!("{}'s clipboard is not reachable right now", dev.name);
                 }
@@ -1260,7 +1342,7 @@ impl State {
                     Err(anyhow!("{}'s clipboard is not reachable right now", dev.name))
                 };
                 if let Err(e) = direct {
-                    if let Some((ls, peer)) = self.ls_peer(&dev.name) {
+                    if let Some((ls, peer)) = self.ls_device(&dev).await {
                         ls.send_text(&peer, &text).await?;
                     } else if let Some((qs, peer)) = self.qs_peer(&dev.name) {
                         qs.send_text(&peer, &text).await?;
@@ -1334,7 +1416,7 @@ impl State {
                 self.update_cfg(|cfg| {
                     match cfg.devices.iter_mut().find(|d| d.id.as_deref() == Some(&ids)) {
                         Some(d) => d.name = name.clone(),
-                        None => cfg.devices.push(Device { name: name.clone(), id: Some(ids.clone()), serial: None, clip: true }),
+                        None => cfg.devices.push(Device { name: name.clone(), id: Some(ids.clone()), serial: None, clip: true, localsend: None }),
                     }
                     Ok(())
                 })?;

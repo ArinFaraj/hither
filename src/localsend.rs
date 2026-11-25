@@ -56,6 +56,32 @@ pub trait Host: Send + Sync + 'static {
 }
 
 pub const CLIP_IMAGE: &str = ".hither-clipboard.png";
+pub const CLIP_TEXT: &str = ".hither-clipboard.txt";
+
+#[derive(Serialize, Deserialize)]
+struct Known {
+    alias: String,
+    fingerprint: String,
+    ip: IpAddr,
+    port: u16,
+    https: bool,
+}
+
+fn known_path() -> PathBuf {
+    store::data_dir().join("localsend-peers.json")
+}
+
+fn load_known() -> HashMap<String, Peer> {
+    let Ok(bytes) = std::fs::read(known_path()) else { return HashMap::new() };
+    let list: Vec<Known> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let stale = Instant::now().checked_sub(FRESH).unwrap_or_else(Instant::now);
+    list.into_iter()
+        .map(|k| {
+            let p = Peer { alias: k.alias, fingerprint: k.fingerprint.clone(), ip: k.ip, port: k.port, https: k.https, device_type: None, model: None, seen: stale };
+            (k.fingerprint, p)
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Peer {
@@ -424,7 +450,7 @@ impl LocalSend {
             provider,
             cert,
             key,
-            peers: Mutex::new(HashMap::new()),
+            peers: Mutex::new(load_known()),
             session: Mutex::new(None),
             udp,
             send_lock: Mutex::new(()),
@@ -560,12 +586,22 @@ impl LocalSend {
             seen: Instant::now(),
         };
         let mut peers = self.peers.lock().unwrap();
-        if let Some(old) = peers.get(&fp) {
-            if old.https && !peer.https && old.seen.elapsed() < FRESH {
-                return old.clone();
+        let moved = match peers.get(&fp) {
+            Some(old) if old.https && !peer.https && old.seen.elapsed() < FRESH => return old.clone(),
+            Some(old) => old.ip != peer.ip || old.port != peer.port || old.alias != peer.alias,
+            None => true,
+        };
+        peers.insert(fp.clone(), peer.clone());
+        if moved && self.host.trusted(&fp) {
+            let list: Vec<Known> = peers
+                .values()
+                .filter(|p| self.host.trusted(&p.fingerprint))
+                .map(|p| Known { alias: p.alias.clone(), fingerprint: p.fingerprint.clone(), ip: p.ip, port: p.port, https: p.https })
+                .collect();
+            if let Ok(bytes) = serde_json::to_vec(&list) {
+                let _ = std::fs::write(known_path(), bytes);
             }
         }
-        peers.insert(fp, peer.clone());
         peer
     }
 
@@ -636,6 +672,73 @@ impl LocalSend {
         })
     }
 
+    async fn ask_trust(&self, msg: &str, yes: &str, verified: Option<&str>) -> bool {
+        let buttons: Vec<&str> = match verified {
+            Some(_) => vec!["Ignore", "Always accept", yes],
+            None => vec!["Ignore", yes],
+        };
+        match ask("Hither", msg, &buttons).await.as_deref() {
+            Some("Always accept") => {
+                if let Some(fp) = verified {
+                    self.host.trust(fp);
+                }
+                true
+            }
+            Some(b) => b == yes,
+            None => false,
+        }
+    }
+
+    pub fn peer(&self, fp: &str) -> Option<Peer> {
+        self.peers.lock().unwrap().values().find(|p| p.fingerprint.eq_ignore_ascii_case(fp)).cloned()
+    }
+
+    pub async fn add(&self, ip: IpAddr, port: u16, fp: &str) -> Option<Peer> {
+        let stub = Peer {
+            alias: String::new(),
+            fingerprint: fp.to_string(),
+            ip,
+            port,
+            https: true,
+            device_type: None,
+            model: None,
+            seen: Instant::now(),
+        };
+        self.probe(&stub).await
+    }
+
+    async fn probe(&self, p: &Peer) -> Option<Peer> {
+        let (status, bytes) = self
+            .http(p, Method::GET, &format!("{API}/info"), json_body(Vec::new()), None, Duration::from_secs(3))
+            .await
+            .ok()?;
+        let info: Info = serde_json::from_slice(&bytes).ok().filter(|_| status.is_success())?;
+        if !info.fingerprint.eq_ignore_ascii_case(&p.fingerprint) {
+            return None;
+        }
+        Some(self.remember(&info, p.ip, p.fingerprint.clone()))
+    }
+
+    pub async fn reach(&self, fp: &str) -> Option<Peer> {
+        if let Some(p) = self.peer(fp) {
+            if p.seen.elapsed() < Duration::from_secs(60) {
+                return Some(p);
+            }
+            if let Some(p) = self.probe(&p).await {
+                return Some(p);
+            }
+        }
+        self.multicast(&self.info(Some(true)));
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if let Some(p) = self.peer(fp).filter(|p| p.seen.elapsed() < Duration::from_secs(4)) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     async fn on_register(&self, ip: IpAddr, cert_fp: Option<String>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let info: Info = read_json(req.into_body(), 1 << 16).await?;
         if let Some(fp) = self.verify(ip, cert_fp, &info).await {
@@ -663,7 +766,7 @@ impl LocalSend {
                 let text = f.preview.clone().unwrap_or_default();
                 let take = trusted || {
                     let shown: String = text.chars().take(300).collect();
-                    ask("Hither", &format!("{from} sent you text:\n\n{shown}"), &["Ignore", "Copy"]).await.as_deref() == Some("Copy")
+                    self.ask_trust(&format!("{from} sent you text:\n\n{shown}"), "Copy", verified.as_deref()).await
                 };
                 if take {
                     self.host.text(&from, &text);
@@ -677,7 +780,7 @@ impl LocalSend {
             if p.files.values().next().is_some_and(|f| f.size > crate::clip::MAX_IMAGE) {
                 return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, Some(json!({"message": "Image too large"}))));
             }
-            if !trusted && ask("Hither", &format!("{from} sent you an image for the clipboard"), &["Ignore", "Copy"]).await.as_deref() != Some("Copy") {
+            if !trusted && !self.ask_trust(&format!("{from} sent you an image for the clipboard"), "Copy", verified.as_deref()).await {
                 return Ok(reply(StatusCode::FORBIDDEN, Some(json!({"message": "Rejected"}))));
             }
         } else if !trusted {
@@ -864,25 +967,29 @@ impl LocalSend {
     }
 
     pub async fn send_text(&self, peer: &Peer, text: &str) -> Result<()> {
+        self.send_bytes(peer, "message.txt", "text/plain", text.as_bytes().to_vec(), Some(text.to_string())).await
+    }
+
+    pub async fn send_clip(&self, peer: &Peer, clip: &crate::clip::Clip) -> Result<()> {
+        match clip {
+            crate::clip::Clip::Text(t) => self.send_bytes(peer, CLIP_TEXT, "text/plain", t.as_bytes().to_vec(), Some(t.clone())).await,
+            crate::clip::Clip::Image(b) => self.send_bytes(peer, CLIP_IMAGE, "image/png", b.clone(), None).await,
+        }
+    }
+
+    async fn send_bytes(&self, peer: &Peer, name: &str, mime: &str, bytes: Vec<u8>, preview: Option<String>) -> Result<()> {
+        let len = bytes.len() as u64;
         let mut files = HashMap::new();
         files.insert(
             "0".to_string(),
-            FileDto {
-                id: "0".into(),
-                file_name: "message.txt".into(),
-                size: text.len() as u64,
-                file_type: "text/plain".into(),
-                sha256: None,
-                preview: Some(text.to_string()),
-            },
+            FileDto { id: "0".into(), file_name: name.into(), size: len, file_type: mime.into(), sha256: None, preview },
         );
-        if let Some(resp) = self.prepare(peer, files).await? {
-            if let Some(tok) = resp.files.get("0") {
-                let q = format!("{API}/upload?sessionId={}&fileId=0&token={}", encode(&resp.session_id), encode(tok));
-                let bytes = Bytes::from(text.as_bytes().to_vec());
-                let len = bytes.len() as u64;
-                self.http(peer, Method::POST, &q, json_body(bytes.to_vec()), Some(len), Duration::from_secs(60)).await?;
-            }
+        let Some(resp) = self.prepare(peer, files).await? else { return Ok(()) };
+        let Some(tok) = resp.files.get("0") else { return Ok(()) };
+        let q = format!("{API}/upload?sessionId={}&fileId=0&token={}", encode(&resp.session_id), encode(tok));
+        let (status, _) = self.http(peer, Method::POST, &q, json_body(bytes), Some(len), Duration::from_secs(300)).await?;
+        if !status.is_success() {
+            bail!("{} stopped the transfer ({status})", peer.alias);
         }
         Ok(())
     }

@@ -26,8 +26,10 @@ through a relay when nothing closer works.
   picker. Files that arrive by AirDrop show up in the hither menu.
 - **A Mac menu bar app** with every device in one list, drag and drop, and a
   button to send the clipboard.
-- **An Android app** with a share sheet entry and a Quick Settings tile that sends
-  the clipboard to the device you picked.
+- **An Android app** that receives in the background like a LocalSend device, so
+  hither and LocalSend apps nearby can send to the phone without opening anything.
+  It sends from the share sheet, the text selection menu and a Quick Settings
+  tile, and puts new screenshots on your computer's clipboard.
 - **Updates itself** from GitHub releases, with signed checksums.
 
 A device that is reachable several ways (your phone over USB and over Quick Share,
@@ -67,6 +69,19 @@ hither android install
 
 The app needs Android 13 or newer. After that hither keeps it up to date whenever
 the phone is connected over adb.
+
+The app keeps a small receiver running with a silent notification. Files land in
+`Downloads/Hither`, text and images sent for the clipboard go straight to the
+clipboard, and other files from devices you have not accepted before ask first.
+Pick your computer once with Choose the device, and the tile, the text selection
+menu and new screenshots go there.
+
+When the phone is connected over adb, hither on the computer pairs the two for
+LocalSend by itself: each trusts the other, the app is allowed to run in the
+background and to post notifications, and the phone becomes the computer's
+clipboard peer over Wi-Fi. On networks that drop multicast (common on office
+Wi-Fi) both sides still find each other: the phone looks through its subnet and
+both remember the last address of the other.
 
 ## Use
 
@@ -123,7 +138,9 @@ both match. A build running out of a cargo `target` folder is never replaced.
 - The local control socket and every key file are readable only by your user.
   The Mac app only acts on `hither://` links that carry a secret from the data
   folder, so web pages and other apps cannot trigger it.
-- The Android app accepts clipboard writes only from adb.
+- The Android app accepts clipboard writes and pairing only from adb. Its
+  receiver uses HTTPS with a key kept in the Android keystore, and it trusts a
+  sender only after you tap Always accept, pick it as your device, or pair over adb.
 
 To report a security problem, please open a
 [private advisory](https://github.com/ArinFaraj/hither/security/advisories/new)

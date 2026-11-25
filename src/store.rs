@@ -37,6 +37,8 @@ pub struct Device {
     pub serial: Option<String>,
     #[serde(default = "yes")]
     pub clip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub localsend: Option<String>,
 }
 
 fn yes() -> bool {
