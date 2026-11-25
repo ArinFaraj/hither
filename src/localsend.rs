@@ -169,6 +169,7 @@ pub struct LocalSend {
     cert: CertificateDer<'static>,
     key: PrivatePkcs8KeyDer<'static>,
     peers: Mutex<HashMap<String, Peer>>,
+    saved: Mutex<std::collections::HashSet<String>>,
     session: Mutex<Option<Upload>>,
     udp: Arc<UdpSocket>,
     send_lock: Mutex<()>,
@@ -284,7 +285,7 @@ fn bind_udp() -> Result<UdpSocket> {
 }
 
 #[cfg(unix)]
-fn interfaces() -> Vec<Ipv4Addr> {
+pub fn interfaces() -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -318,7 +319,7 @@ fn interfaces() -> Vec<Ipv4Addr> {
 }
 
 #[cfg(not(unix))]
-fn interfaces() -> Vec<Ipv4Addr> {
+pub fn interfaces() -> Vec<Ipv4Addr> {
     vec![Ipv4Addr::UNSPECIFIED]
 }
 
@@ -451,6 +452,7 @@ impl LocalSend {
             cert,
             key,
             peers: Mutex::new(load_known()),
+            saved: Mutex::new(load_known().into_keys().collect()),
             session: Mutex::new(None),
             udp,
             send_lock: Mutex::new(()),
@@ -592,7 +594,8 @@ impl LocalSend {
             None => true,
         };
         peers.insert(fp.clone(), peer.clone());
-        if moved && self.host.trusted(&fp) {
+        let unsaved = !self.saved.lock().unwrap().contains(&fp);
+        if (moved || unsaved) && self.host.trusted(&fp) {
             let list: Vec<Known> = peers
                 .values()
                 .filter(|p| self.host.trusted(&p.fingerprint))
@@ -601,6 +604,7 @@ impl LocalSend {
             if let Ok(bytes) = serde_json::to_vec(&list) {
                 let _ = std::fs::write(known_path(), bytes);
             }
+            *self.saved.lock().unwrap() = list.into_iter().map(|k| k.fingerprint).collect();
         }
         peer
     }

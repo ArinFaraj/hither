@@ -80,8 +80,11 @@ When the phone is connected over adb, hither on the computer pairs the two for
 LocalSend by itself: each trusts the other, the app is allowed to run in the
 background and to post notifications, and the phone becomes the computer's
 clipboard peer over Wi-Fi. On networks that drop multicast (common on office
-Wi-Fi) both sides still find each other: the phone looks through its subnet and
-both remember the last address of the other.
+Wi-Fi) both sides still find each other, because pairing hands the phone the
+computer's address and both remember the last address of the other. Without adb,
+Enter an address in the device list connects to a device directly. hither never
+sweeps the subnet the way LocalSend falls back to doing: managed Wi-Fi reads that
+as an attack and drops the phone off the network.
 
 ## Use
 

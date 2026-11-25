@@ -62,8 +62,6 @@ final class Node {
     private volatile int port;
     private long lastAnnounce = -60_000;
     private String lastAddress;
-    private long lastScan = -3_600_000;
-    private String lastScanned;
 
     private Node(Context app) {
         this.app = app;
@@ -217,7 +215,6 @@ final class Node {
     Peer refresh(Peer p, long waitMs) {
         long before = System.currentTimeMillis();
         announce(true);
-        pool.execute(() -> scan(60_000));
         long end = SystemClock.elapsedRealtime() + waitMs;
         while (SystemClock.elapsedRealtime() < end) {
             Peer q = peer(p.fingerprint);
@@ -247,68 +244,36 @@ final class Node {
         }
         pool.execute(() -> {
             multicast(true);
-            List<Peer> known = Hither.known(app);
-            java.util.concurrent.atomic.AtomicInteger answered = new java.util.concurrent.atomic.AtomicInteger();
-            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(known.size());
-            for (Peer p : known) {
+            for (Peer p : Hither.known(app)) {
+                if (p.ip.isEmpty()) continue;
                 pool.execute(() -> {
                     try {
-                        if (!p.ip.isEmpty() && remember(LocalSend.register(app, p, 3000)) != null) answered.incrementAndGet();
+                        remember(LocalSend.register(app, p, 3000));
                     } catch (IOException | RuntimeException ignored) {
-                    } finally {
-                        done.countDown();
                     }
                 });
             }
             SystemClock.sleep(400);
             multicast(true);
-            try {
-                done.await(4, java.util.concurrent.TimeUnit.SECONDS);
-            } catch (InterruptedException ignored) {
-            }
-            if (!known.isEmpty() && answered.get() == 0) scan(60 * 60_000);
         });
     }
 
-    void scan(long every) {
-        String me = lanAddress();
-        if (me == null) return;
-        synchronized (this) {
-            long now = SystemClock.elapsedRealtime();
-            if (me.equals(lastScanned) && now - lastScan < every) return;
-            lastScan = now;
-            lastScanned = me;
-        }
-        String base = me.substring(0, me.lastIndexOf('.') + 1);
-        ExecutorService ex = Executors.newFixedThreadPool(48);
-        for (int i = 1; i < 255; i++) {
-            String ip = base + i;
-            if (!ip.equals(me)) ex.execute(() -> probe(ip));
-        }
-        ex.shutdown();
-    }
-
-    private void probe(String ip) {
-        for (int p : new int[] {LocalSend.PORT, 53318}) {
-            try (java.net.Socket s = new java.net.Socket()) {
-                s.connect(new InetSocketAddress(ip, p), 600);
-            } catch (IOException e) {
-                continue;
-            }
+    Peer connect(String ip) {
+        for (int port : new int[] {LocalSend.PORT, 53318}) {
             Peer stub = new Peer();
             stub.alias = ip;
             stub.fingerprint = "";
             stub.ip = ip;
-            stub.port = p;
+            stub.port = port;
             for (boolean https : new boolean[] {true, false}) {
                 stub.https = https;
                 try {
-                    remember(LocalSend.register(app, stub, 2000));
-                    break;
+                    return remember(LocalSend.register(app, stub, 3000));
                 } catch (IOException | RuntimeException ignored) {
                 }
             }
         }
+        return null;
     }
 
     private void multicast(boolean announce) {

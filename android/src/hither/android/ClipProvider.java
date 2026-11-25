@@ -165,6 +165,19 @@ public final class ClipProvider extends ContentProvider {
         return m;
     }
 
+    private static String pick(String ips) {
+        if (ips == null || ips.isEmpty()) return "";
+        String[] all = ips.split(",");
+        String mine = Node.lanAddress();
+        if (mine != null) {
+            String net = mine.substring(0, mine.lastIndexOf('.') + 1);
+            for (String ip : all) {
+                if (ip.trim().startsWith(net)) return ip.trim();
+            }
+        }
+        return all[0].trim();
+    }
+
     @Override
     public Uri insert(Uri u, ContentValues v) {
         if (!"/trust".equals(u.getPath()) || !shell() || v == null) return null;
@@ -173,16 +186,16 @@ public final class ClipProvider extends ContentProvider {
         if (fp == null || fp.isEmpty()) return null;
         Context c = getContext();
         Hither.trust(c, fp);
-        if (alias != null && Hither.target(c) == null) {
-            Peer p = new Peer();
-            p.alias = alias;
-            p.fingerprint = fp.toUpperCase(java.util.Locale.ROOT);
-            p.ip = "";
-            p.port = LocalSend.PORT;
-            p.https = true;
-            p.type = "desktop";
-            Hither.setTarget(c, p);
-        }
+        Peer p = new Peer();
+        p.alias = alias == null ? "Computer" : alias;
+        p.fingerprint = fp.toUpperCase(java.util.Locale.ROOT);
+        p.ip = pick(v.getAsString("ips"));
+        Integer port = v.getAsInteger("port");
+        p.port = port == null ? LocalSend.PORT : port;
+        p.https = true;
+        p.type = "desktop";
+        if (!p.ip.isEmpty()) Hither.remember(c, p);
+        if (Hither.target(c) == null) Hither.setTarget(c, p);
         Receiver.start(c);
         Node.get(c).announce(true);
         return u;

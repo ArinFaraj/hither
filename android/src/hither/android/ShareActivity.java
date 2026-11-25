@@ -1,12 +1,16 @@
 package hither.android;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.InputType;
 import android.view.View;
 import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ProgressBar;
@@ -41,7 +45,7 @@ public final class ShareActivity extends Activity {
                 main.postDelayed(this, 3000);
             } else {
                 spin.setVisibility(View.GONE);
-                if (peers.isEmpty()) status.setText("No devices found. Is hither or LocalSend open on the same Wi-Fi?");
+                if (peers.isEmpty()) status.setText("No devices found. Some Wi-Fi networks block finding devices: enter the computer's address, or connect the phone to it over USB once.");
             }
         }
     };
@@ -79,6 +83,10 @@ public final class ShareActivity extends Activity {
         list.setAdapter(adapter);
         list.setOnItemClickListener((parent, view, pos, id) -> pick(peers.get(pos)));
         root.addView(list, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (int) (280 * getResources().getDisplayMetrics().density)));
+        Button manual = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        manual.setText("Enter an address");
+        manual.setOnClickListener(v -> askAddress());
+        root.addView(manual);
         setContentView(root);
         setFinishOnTouchOutside(true);
         refresh();
@@ -91,10 +99,7 @@ public final class ShareActivity extends Activity {
         Node node = Node.get(this);
         node.addListener(listener);
         node.picking(true);
-        node.pool.execute(() -> {
-            node.startQuietly();
-            node.scan(60_000);
-        });
+        node.pool.execute(node::startQuietly);
         rounds = 0;
         main.post(search);
     }
@@ -106,6 +111,30 @@ public final class ShareActivity extends Activity {
         node.removeListener(listener);
         node.picking(false);
         super.onStop();
+    }
+
+    private void askAddress() {
+        EditText field = new EditText(this);
+        field.setHint("192.168.1.20");
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        new AlertDialog.Builder(this)
+                .setTitle("Address of the device")
+                .setView(field)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton("Connect", (d, w) -> {
+                    String ip = field.getText().toString().trim();
+                    if (ip.isEmpty()) return;
+                    status.setText("Connecting to " + ip);
+                    Node node = Node.get(this);
+                    node.pool.execute(() -> {
+                        Peer p = node.connect(ip);
+                        main.post(() -> {
+                            if (p == null) status.setText("Nothing answered at " + ip);
+                            else refresh();
+                        });
+                    });
+                })
+                .show();
     }
 
     private List<LocalSend.Item> load(Intent i) {

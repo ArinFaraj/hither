@@ -460,17 +460,18 @@ async fn link_phone(st: Arc<State>, serial: String, transport: String) {
         return;
     };
     let me = st.cfg.lock().unwrap().name.clone();
+    let ips = localsend::interfaces().iter().filter(|ip| !ip.is_unspecified()).map(|ip| ip.to_string()).collect::<Vec<_>>().join(",");
+    let ips = if ips.is_empty() { String::new() } else { format!(" --bind ips:s:{ips}") };
     let script = format!(
         "cmd deviceidle whitelist +hither.android >/dev/null 2>&1; \
          pm grant hither.android android.permission.POST_NOTIFICATIONS 2>/dev/null; \
          pm grant hither.android android.permission.READ_MEDIA_IMAGES 2>/dev/null; \
-         content insert --uri content://hither.android.clip/trust --bind fingerprint:s:{} --bind alias:s:{}",
+         content insert --uri content://hither.android.clip/trust --bind fingerprint:s:{} --bind alias:s:{}{} --bind port:i:{}",
         ls.fingerprint(),
-        adb::quote(&me)
+        adb::quote(&me),
+        ips,
+        localsend::PORT
     );
-    if let Err(e) = adb::shell(&transport, &script).await {
-        eprintln!("linking {serial}: {e:#}");
-    }
     let _ = st.update_cfg(|c| {
         if let Some(d) = c.devices.iter_mut().find(|d| d.serial.as_deref() == Some(&serial)) {
             d.localsend = Some(fp.clone());
@@ -480,6 +481,9 @@ async fn link_phone(st: Arc<State>, serial: String, transport: String) {
         }
         Ok(())
     });
+    if let Err(e) = adb::shell(&transport, &script).await {
+        eprintln!("linking {serial}: {e:#}");
+    }
     let ip = column(&row, "ip").and_then(|i| i.parse().ok());
     let port = column(&row, "port").and_then(|p| p.parse().ok()).filter(|p| *p != 0);
     if let (Some(ip), Some(port)) = (ip, port) {
